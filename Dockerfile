@@ -9,7 +9,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY rss_downloader.py .
-COPY downloads/ ./downloads/
 
 EXPOSE 8080
 
