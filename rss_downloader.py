@@ -112,7 +112,7 @@ class RSSRequestHandler(http.server.SimpleHTTPRequestHandler):
 def run_server():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     handler = RSSRequestHandler
-    with socketserver.TCPServer(("localhost", 8080), handler) as httpd:
+    with socketserver.TCPServer(("0.0.0.0", 8080), handler) as httpd:
         print("Serving RSS feed and audio files at http://localhost:8080/rss")
         httpd.serve_forever()
 
