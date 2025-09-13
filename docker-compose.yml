@@ -1,14 +1,13 @@
-version: '3.8'
+version: '3.3'
 
 services:
   youtube-podcast-server:
-    image: youtube-podcast-server:latest
+    build: .
     container_name: youtube-podcast-server
     restart: unless-stopped
     ports:
       - "5757:8080"
     volumes:
       - /DATA/AppData/youtube-podcast-server/downloads:/app/downloads
-      - /DATA/AppData/youtube-podcast-server/logs:/app/logs
     environment:
       - TZ=America/New_York
