@@ -22,6 +22,7 @@ def download_audio(youtube_url):
         "--embed-metadata",
         "--embed-thumbnail",
         "--write-description",
+        "--restrict-filenames",
         "--postprocessor-args", "ffmpeg:-metadata comment='%(description)s'",
         "-o", os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
         youtube_url
@@ -44,7 +45,7 @@ def generate_rss_feed():
                     description = f.read()
 
             pub_date = datetime.utcfromtimestamp(os.path.getmtime(filepath)).strftime('%a, %d %b %Y %H:%M:%S GMT')
-            url = f"http://localhost:8080/audio/{urllib.parse.quote(filename)}"
+            url = f"http://casaos.local:5757/audio/{urllib.parse.quote(filename)}"
             items.append(f"""
                 <item>
                     <title>{escape(filename)}</title>
@@ -58,7 +59,7 @@ def generate_rss_feed():
     <rss version="2.0">
       <channel>
         <title>Downloaded YouTube Audio</title>
-        <link>http://localhost:8080/rss</link>
+        <link>http://casaos.local:5757/rss</link>
         <description>All downloaded audio files</description>
         {''.join(items)}
       </channel>
@@ -113,7 +114,7 @@ def run_server():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     handler = RSSRequestHandler
     with socketserver.TCPServer(("0.0.0.0", 8080), handler) as httpd:
-        print("Serving RSS feed and audio files at http://localhost:8080/rss")
+        print("Serving RSS feed and audio files at http://casaos.local:5757/rss")
         httpd.serve_forever()
 
 if __name__ == "__main__":
