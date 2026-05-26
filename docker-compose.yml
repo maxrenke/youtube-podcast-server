@@ -8,8 +8,10 @@ services:
       - "5757:8080"
     volumes:
       - /DATA/AppData/youtube-podcast-server/downloads:/app/downloads
+      - /DATA/AppData/youtube-podcast-server/state:/app/state
     environment:
       - TZ=America/New_York
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-https://podcast.maxrenke.com}
       - FEED_TITLE=YouTube Podcast
       - FEED_AUTHOR=Max Renke
+      - POLL_INTERVAL_SECONDS=${POLL_INTERVAL_SECONDS:-3600}

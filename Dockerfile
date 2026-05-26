@@ -13,6 +13,8 @@ COPY rss_downloader.py tasks.py ./
 
 ENV PORT=8080 \
     DOWNLOAD_DIR=/app/downloads \
+    STATE_DIR=/app/state \
+    POLL_INTERVAL_SECONDS=3600 \
     PUBLIC_BASE_URL=http://localhost:5757
 
 EXPOSE 8080

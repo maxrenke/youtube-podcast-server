@@ -7,7 +7,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, unquote
 
 import tasks
-from tasks import DOWNLOAD_DIR, enqueue_download, get_task, list_tasks
+from tasks import (
+    DOWNLOAD_DIR,
+    add_subscription,
+    enqueue_download,
+    get_subscription,
+    get_task,
+    list_subscriptions,
+    list_tasks,
+    remove_subscription,
+)
 
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://localhost:5757").rstrip("/")
 FEED_TITLE = os.environ.get("FEED_TITLE", "YouTube Podcast")
@@ -96,35 +105,82 @@ def generate_rss():
 INDEX_HTML = """<!doctype html>
 <meta charset="utf-8"><title>YouTube Podcast</title>
 <style>
-body{font-family:system-ui,sans-serif;max-width:800px;margin:2rem auto;padding:0 1rem}
+body{font-family:system-ui,sans-serif;max-width:820px;margin:2rem auto;padding:0 1rem}
 input,button{font-size:1rem;padding:.5rem}
-input{width:70%}
-.ep{border-bottom:1px solid #ddd;padding:.5rem 0}
+input{width:65%}
+.ep,.sub{border-bottom:1px solid #ddd;padding:.5rem 0}
 .muted{color:#666;font-size:.85em}
+.row{display:flex;gap:.5rem;align-items:center}
+button.danger{background:#fee;border:1px solid #c66;color:#a00}
+h2{margin-top:1.5rem}
 </style>
 <h1>YouTube Podcast</h1>
 <p>Feed: <a id="feed" href="/rss">/rss</a></p>
-<form id="f"><input id="u" placeholder="YouTube URL" required><button>Download</button></form>
-<p id="msg" class="muted"></p>
+
+<h2>Download single video</h2>
+<form id="dlForm"><input id="dlUrl" placeholder="https://www.youtube.com/watch?v=..." required><button>Download</button></form>
+<p id="dlMsg" class="muted"></p>
+
+<h2>Subscribe to playlist or channel</h2>
+<p class="muted">Polled hourly. First pull starts immediately. yt-dlp <code>--download-archive</code> means already-downloaded videos are skipped.</p>
+<form id="subForm"><input id="subUrl" placeholder="https://www.youtube.com/playlist?list=... or https://www.youtube.com/@channel" required><button>Subscribe</button></form>
+<p id="subMsg" class="muted"></p>
+<div id="subs"></div>
+
 <h2>Episodes</h2><div id="eps"></div>
-<h2>Tasks</h2><div id="tasks"></div>
+<h2>Recent tasks</h2><div id="tasks"></div>
+
 <script>
+function fmtTs(s){ return s ? new Date(s).toLocaleString() : 'never'; }
+function fmtNext(ep){
+  if(!ep) return 'soon';
+  const ms = ep*1000 - Date.now();
+  if(ms <= 0) return 'soon';
+  const m = Math.round(ms/60000);
+  return m < 60 ? m+'m' : Math.round(m/60)+'h';
+}
 async function refresh(){
   const eps = await (await fetch('/episodes')).json();
   document.getElementById('eps').innerHTML = eps.map(e =>
     `<div class="ep"><b>${e.title}</b><br>
      <span class="muted">${(e.size/1048576).toFixed(1)} MB - ${new Date(e.mtime*1000).toLocaleString()}</span><br>
-     <audio controls src="/audio/${encodeURIComponent(e.filename)}"></audio></div>`).join('');
+     <audio controls src="/audio/${encodeURIComponent(e.filename)}"></audio></div>`).join('') || '<p class="muted">no episodes yet</p>';
+
+  const subs = await (await fetch('/subscriptions')).json();
+  document.getElementById('subs').innerHTML = subs.map(s => {
+    const last = s.last_result ? (s.last_result.ok ? `+${s.last_result.new||0} new` : `error: ${s.last_result.error}`) : '-';
+    return `<div class="sub row">
+      <div style="flex:1">
+        <div><a href="${s.url}" target="_blank">${s.url}</a></div>
+        <div class="muted">added ${fmtTs(s.added)} - last poll ${fmtTs(s.last_poll)} (${last}) - next in ${fmtNext(s.next_poll)}</div>
+      </div>
+      <button class="danger" onclick="del('${s.id}')">Unsubscribe</button>
+    </div>`;
+  }).join('') || '<p class="muted">no subscriptions</p>';
+
   const ts = await (await fetch('/tasks')).json();
-  document.getElementById('tasks').innerHTML = ts.slice().reverse().map(t =>
-    `<div class="muted">[${t.status}] ${t.url} ${t.error?'- '+t.error:''}</div>`).join('');
+  document.getElementById('tasks').innerHTML = ts.slice(-25).reverse().map(t =>
+    `<div class="muted">[${t.status}] (${t.type}) ${t.url} ${t.error?'- '+t.error:''} ${t.downloaded&&t.downloaded.length?'- pulled '+t.downloaded.length:''}</div>`).join('') || '<p class="muted">no tasks</p>';
 }
-document.getElementById('f').onsubmit = async e => {
+async function del(id){
+  if(!confirm('Unsubscribe?')) return;
+  await fetch('/subscriptions/'+id, {method:'DELETE'});
+  refresh();
+}
+document.getElementById('dlForm').onsubmit = async e => {
   e.preventDefault();
-  const u = document.getElementById('u').value;
+  const u = document.getElementById('dlUrl').value;
   const r = await fetch('/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:u})});
-  document.getElementById('msg').textContent = r.ok ? 'queued' : 'error';
-  document.getElementById('u').value='';
+  document.getElementById('dlMsg').textContent = r.ok ? 'queued' : 'error';
+  document.getElementById('dlUrl').value='';
+  refresh();
+};
+document.getElementById('subForm').onsubmit = async e => {
+  e.preventDefault();
+  const u = document.getElementById('subUrl').value;
+  const r = await fetch('/subscriptions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:u})});
+  document.getElementById('subMsg').textContent = r.ok ? 'subscribed; first poll starting' : 'error';
+  document.getElementById('subUrl').value='';
   refresh();
 };
 refresh(); setInterval(refresh, 5000);
@@ -180,6 +236,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(404, {"error": "not found"})
             else:
                 self._json(200, t)
+        elif path == "/subscriptions":
+            self._json(200, list_subscriptions())
+        elif path.startswith("/subscriptions/"):
+            s = get_subscription(path[len("/subscriptions/"):])
+            if not s:
+                self._json(404, {"error": "not found"})
+            else:
+                self._json(200, s)
         elif path.startswith("/audio/"):
             filename = unquote(path[len("/audio/"):])
             if "/" in filename or ".." in filename:
@@ -204,14 +268,19 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._text(404, "not found")
 
+    def _read_json(self) -> dict | None:
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            self._json(400, {"error": "invalid json"})
+            return None
+
     def do_POST(self):
         if self.path == "/download":
-            length = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(length) if length else b"{}"
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                self._json(400, {"error": "invalid json"})
+            data = self._read_json()
+            if data is None:
                 return
             url = (data.get("url") or "").strip()
             if not url:
@@ -219,6 +288,27 @@ class Handler(BaseHTTPRequestHandler):
                 return
             task_id = enqueue_download(url)
             self._json(202, {"task_id": task_id})
+        elif self.path == "/subscriptions":
+            data = self._read_json()
+            if data is None:
+                return
+            url = (data.get("url") or "").strip()
+            if not url:
+                self._json(400, {"error": "missing url"})
+                return
+            interval = data.get("interval_seconds")
+            sub = add_subscription(url, interval_seconds=interval)
+            self._json(201, sub)
+        else:
+            self._text(404, "not found")
+
+    def do_DELETE(self):
+        if self.path.startswith("/subscriptions/"):
+            sub_id = self.path[len("/subscriptions/"):]
+            if remove_subscription(sub_id):
+                self._json(200, {"deleted": sub_id})
+            else:
+                self._json(404, {"error": "not found"})
         else:
             self._text(404, "not found")
 
