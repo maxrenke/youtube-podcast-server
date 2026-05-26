@@ -10,6 +10,6 @@ services:
       - /DATA/AppData/youtube-podcast-server/downloads:/app/downloads
     environment:
       - TZ=America/New_York
-      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-http://casaos.local:5757}
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-https://podcast.maxrenke.com}
       - FEED_TITLE=YouTube Podcast
       - FEED_AUTHOR=Max Renke
