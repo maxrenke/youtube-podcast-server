@@ -1,8 +1,7 @@
-version: '3.3'
-
 services:
   youtube-podcast-server:
     build: .
+    image: youtube-podcast-server:latest
     container_name: youtube-podcast-server
     restart: unless-stopped
     ports:
@@ -11,3 +10,6 @@ services:
       - /DATA/AppData/youtube-podcast-server/downloads:/app/downloads
     environment:
       - TZ=America/New_York
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-http://casaos.local:5757}
+      - FEED_TITLE=YouTube Podcast
+      - FEED_AUTHOR=Max Renke
