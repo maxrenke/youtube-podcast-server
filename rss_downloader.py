@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 import xml.sax.saxutils as sx
 from email.utils import formatdate
@@ -254,17 +255,46 @@ class Handler(BaseHTTPRequestHandler):
                 self._text(404, "not found")
                 return
             size = os.path.getsize(full)
-            self.send_response(200)
+            start, end = 0, size - 1
+            rng = self.headers.get("Range")
+            if rng:
+                # Single range only: "bytes=start-end", "bytes=start-", "bytes=-suffix"
+                m = re.match(r"bytes=(\d*)-(\d*)$", rng.strip())
+                if not m or (m.group(1) == "" and m.group(2) == ""):
+                    self.send_response(416)
+                    self.send_header("Content-Range", "bytes */%d" % size)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if m.group(1) == "":
+                    start = max(0, size - int(m.group(2)))
+                else:
+                    start = int(m.group(1))
+                    if m.group(2) != "":
+                        end = min(int(m.group(2)), size - 1)
+                if start > end or start >= size:
+                    self.send_response(416)
+                    self.send_header("Content-Range", "bytes */%d" % size)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+            length = end - start + 1
+            self.send_response(206 if rng else 200)
             self.send_header("Content-Type", "audio/mpeg")
-            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Length", str(length))
             self.send_header("Accept-Ranges", "bytes")
+            if rng:
+                self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
             self.end_headers()
             with open(full, "rb") as f:
-                while True:
-                    chunk = f.read(64 * 1024)
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(64 * 1024, remaining))
                     if not chunk:
                         break
                     self.wfile.write(chunk)
+                    remaining -= len(chunk)
         else:
             self._text(404, "not found")
 
