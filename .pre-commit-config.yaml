@@ -1,0 +1,15 @@
+repos:
+  - repo: local
+    hooks:
+      - id: ruff
+        name: Run ruff
+        entry: ruff check --fix
+        language: system
+        types: [python]
+        pass_filenames: true
+      - id: mypy
+        name: Run mypy
+        entry: mypy --show-error-codes
+        language: system
+        types: [python]
+        pass_filenames: true

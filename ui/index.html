@@ -1,0 +1,136 @@
+# Basic UI Structure
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Podcast Manager</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 8px; border: 1px solid #ccc; }
+        .actions { text-align: center; }
+    </style>
+</head>
+<body>
+    <h1>Podcast Episodes</h1>
+    <form id="newEpisodeForm">
+        <input type="text" id="episodeUrl" placeholder="YouTube URL" required>
+        <button type="submit">Add Episode</button>
+    </form>
+
+    <h2>Episode List</h2>
+    <table id="episodeTable">
+        <thead>
+            <tr>
+                <th>Title</th>
+                <th>Description</th>
+                <th>File Size</th>
+                <th>Duration</th>
+                <th>Date</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            <!-- Episodes will appear here -->
+        </tbody>
+    </table>
+
+    <h2>Task Queue</h2>
+    <table id="taskTable">
+        <thead>
+            <tr>
+                <th>Task ID</th>
+                <th>Status</th>
+                <th>URL</th>
+                <th>Started</th>
+                <th>Ended</th>
+            </tr>
+        </thead>
+        <tbody>
+            <!-- Tasks will appear here -->
+        </tbody>
+    </table>
+
+<script>
+  // Fetch episodes
+  async function fetchEpisodes() {
+    const response = await fetch('/episodes');
+    const episodes = await response.json();
+    const tableBody = document.querySelector('#episodeTable tbody');
+    tableBody.innerHTML = '';
+    episodes.forEach(episode => {
+      const row = document.createElement('tr');
+      row.innerHTML = `
+        <td>${episode.title}</td>
+        <td>${episode.description}</td>
+        <td>${formatSize(episode.size)}</td>
+        <td>${formatDuration(episode.duration)}</td>
+        <td>${new Date(episode.created_at).toLocaleString()}</td>
+        <td class="actions">
+          <button onclick="deleteEpisode('${episode.id}')">Delete</button>
+          <button onclick="viewMetadata('${episode.id}')">Metadata</button>
+          <button onclick="downloadMP3('${episode.id}')">Download</button>
+        </td>
+      `;
+      tableBody.appendChild(row);
+    });
+  }
+
+  // Fetch tasks
+  async function fetchTasks() {
+    const response = await fetch('/tasks');
+    const tasks = await response.json();
+    const tableBody = document.querySelector('#taskTable tbody');
+    tableBody.innerHTML = '';
+    tasks.forEach(task => {
+      const row = document.createElement('tr');
+      row.innerHTML = `
+        <td>${task.id}</td>
+        <td><span class="status ${task.status.toLowerCase()}">${task.status}</span></td>
+        <td>${task.url}</td>
+        <td>${new Date(task.started).toLocaleString()}</td>
+        <td>${task.ended ? new Date(task.ended).toLocaleString() : ''}</td>
+      `;
+      tableBody.appendChild(row);
+    });
+  }
+
+  // Format file size
+  function formatSize(bytes) {
+    if (bytes === 0) return '0 Bytes';
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    return parseFloat((bytes / Math.pow(1024, i)).toFixed(2)) + ' ' + sizes[i];
+  }
+
+  // Format duration
+  function formatDuration(seconds) {
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const remainingSeconds = seconds % 60;
+    return `${hours}h ${minutes}m ${remainingSeconds}s`;
+  }
+
+  // Handle form submission
+  document.getElementById('newEpisodeForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const url = document.getElementById('episodeUrl').value;
+    const response = await fetch('/download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url })
+    });
+    const result = await response.json();
+    alert('Task queued: ' + result.task_id);
+    fetchEpisodes();
+    fetchTasks();
+  });
+
+  // Refresh data every 5 seconds
+  setInterval(() => {
+    fetchEpisodes();
+    fetchTasks();
+  }, 5000);
+</script>
+</body>
+</html>
