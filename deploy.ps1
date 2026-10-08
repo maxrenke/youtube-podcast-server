@@ -28,7 +28,7 @@ Write-Host "==> Pulling + rebuilding on casaos..."
 ssh casaos "cd ~/youtube-podcast-server && git pull --ff-only && docker compose up -d --build"
 
 Write-Host "==> Health check..."
-$health = curl -s http://casaos.local:5757/health
+$health = curl -s http://casaos.local:5757/ping
 Write-Host $health
 
 if ($Logs) {

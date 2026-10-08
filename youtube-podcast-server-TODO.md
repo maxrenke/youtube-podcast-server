@@ -52,13 +52,12 @@ Still open:
 |---|---------------------------------------------------------------------------------------------------------------------------------|--------|
 | J | Container runs as root; files in the data dirs are root-owned, so managing them on the host needs sudo. Not changed: the yt-dlp self-update at start writes to `/usr/local/bin` and needs root. | Low    |
 | N | Cloudflare's CDN terms restrict serving large media files through the proxy on non-Enterprise plans. One listener is unlikely to draw attention, but it is not a supported use - worth reading the current Service-Specific Terms. | Unknown |
-| O | The read-only JSON endpoints (`/tasks`, `/episodes`, `/subscriptions`) are public and show what is queued.                       | Low    |
 
 ## Proposals - status
 
 | #   | Proposal                                   | Status 2026-10-08                                                                      |
 |-----|--------------------------------------------|----------------------------------------------------------------------------------------|
-| P1  | Token on write endpoints                   | Done: `API_TOKEN`, Bearer header on POST/DELETE, UI prompt                             |
+| P1  | Token                                      | Done: `API_TOKEN` on everything except feeds, audio, covers, chapters; browser sign-in |
 | P2  | Delete from the UI                         | Done: `DELETE /episodes/<video_id>` + button                                           |
 | P3  | Retention                                  | Done: `KEEP_DAYS` / `KEEP_COUNT`, off by default                                       |
 | P4  | Persist the queue                          | Done: `STATE_DIR/tasks.json`, re-queue on start, one retry                             |
@@ -76,4 +75,3 @@ Still open:
 
 - Serve the source audio (m4a/opus) without re-encoding: fastest and smallest.
 - Channel avatars as the artwork of per-channel feeds.
-- Put the read-only JSON endpoints behind the token as well (O).

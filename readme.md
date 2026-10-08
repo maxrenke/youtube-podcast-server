@@ -34,9 +34,8 @@ re-polled on a schedule so new uploads get pulled automatically.
   PocketCasts, Overcast, Apple Podcasts, AntennaPod, etc.
 - **Tiny built-in UI** at `/` for submitting URLs, browsing and deleting
   episodes, managing subscriptions, and watching task status.
-- **Token-protected writes** - with `API_TOKEN` set, every POST and DELETE
-  needs `Authorization: Bearer <token>`; the feed, audio and covers stay open
-  for podcast apps.
+- **Private admin page and API** - with `API_TOKEN` set, only the feeds,
+  audio, covers and chapters are reachable without the token.
 - **A feed per channel** - `/rss/<channel-slug>` next to the all-in-one `/rss`.
 - **Survives restarts** - queued and running downloads are saved and re-queued;
   a failed single download is retried once.
@@ -88,12 +87,24 @@ nginx + Let's Encrypt - whatever).
 
 ## HTTP API
 
-**Authentication.** When `API_TOKEN` is set, every `POST` and `DELETE` must
-send `Authorization: Bearer <token>`; without it the answer is
-`401 {"error": "missing or wrong API token"}`. All `GET`/`HEAD` routes are
-open. The web UI asks for the token on the first write and keeps it in the
-browser's `localStorage`. The curl examples below omit the header for brevity:
-add `-H "Authorization: Bearer $API_TOKEN"`.
+**Authentication.** When `API_TOKEN` is set, everything needs the token
+except what a podcast app fetches without a login:
+
+| Public                                                        | Needs the token                                      |
+|---------------------------------------------------------------|------------------------------------------------------|
+| `/rss`, `/feed`, `/rss/<slug>`                                | `/` (the admin page)                                 |
+| `/audio/*`, `/thumb/*`, `/artwork.jpg`                        | `/episodes`, `/tasks`, `/subscriptions`, `/feeds`, `/health` |
+| `/chapters/<id>.json`, `/ping`                                | every `POST` and `DELETE`                            |
+
+Scripts send `Authorization: Bearer <token>`. A browser opening the admin
+page gets a sign-in prompt: leave the user name empty (or type anything) and
+give the token as the password. Without a valid token the answer is
+`401 {"error": "missing or wrong API token"}`. The curl examples below omit
+the header for brevity: add `-H "Authorization: Bearer $API_TOKEN"`.
+
+Anyone who has the feed address can read the feed and download the audio -
+that is what lets a podcast app work - so treat the address itself as
+private.
 
 Request bodies are limited to 64 KB (`413` beyond that).
 
@@ -434,12 +445,12 @@ Cloudflare Tunnel (`casaos`) to `http://172.17.0.1:5757`.
 
 ## Security
 
-Set `API_TOKEN`. Without it anyone who can reach the server can queue
-downloads, delete episodes and change subscriptions. With it, only the read
-routes are public: the feed, audio, covers, and the JSON status endpoints
-(`/episodes`, `/tasks`, `/subscriptions` - these reveal what you have queued).
-Request URLs are restricted to `http(s)://` and passed to yt-dlp after `--`,
-so a request cannot inject yt-dlp options. For more than a shared secret:
+Set `API_TOKEN`. Without it anyone who can reach the server can open the
+admin page, queue downloads, delete episodes and change subscriptions. With
+it, only the feeds, audio, covers and chapters are public (see the table
+under HTTP API). Request URLs are restricted to `http(s)://` and passed to
+yt-dlp after `--`, so a request cannot inject yt-dlp options. For more than
+a shared secret:
 
 - Put it behind Cloudflare Access (Zero Trust), an OAuth proxy
   (oauth2-proxy), or basic auth via your reverse proxy.

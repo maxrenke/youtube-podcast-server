@@ -1,3 +1,5 @@
+import base64
+import binascii
 import hmac
 import html
 import json
@@ -37,8 +39,10 @@ FEED_CATEGORY = os.environ.get("FEED_CATEGORY", "Technology")
 # episodes are other people's videos, so this feed is for personal use only.
 FEED_PRIVATE = os.environ.get("FEED_PRIVATE", "1").lower() not in ("0", "false", "no")
 ARTWORK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artwork.jpg")
-# When set, every POST and DELETE needs "Authorization: Bearer <API_TOKEN>".
-# GET routes stay open: podcast apps fetch the feed, audio and covers with no login.
+# When set, everything needs the token except what a podcast app fetches with no
+# login: the feeds, audio, covers and chapters (see _is_public). Scripts send
+# "Authorization: Bearer <API_TOKEN>"; a browser gets a Basic sign-in prompt
+# where the password is the token and the user name is ignored.
 API_TOKEN = os.environ.get("API_TOKEN", "")
 MAX_BODY_BYTES = 64 * 1024
 PORT = int(os.environ.get("PORT", "8080"))
@@ -351,17 +355,10 @@ function fmtNext(ep){
   const m = Math.round(ms/60000);
   return m < 60 ? m+'m' : Math.round(m/60)+'h';
 }
-function token(){ try { return localStorage.getItem('token') || ''; } catch(e) { return ''; } }
-// Write requests carry the API token; on 401 ask for it once and retry.
-async function api(method, path, body){
-  const headers = {'Content-Type':'application/json'};
-  if(token()) headers['Authorization'] = 'Bearer ' + token();
-  const r = await fetch(path, {method, headers, body: body ? JSON.stringify(body) : undefined});
-  if(r.status !== 401) return r;
-  const t = prompt('API token (API_TOKEN on the server)');
-  if(!t) return r;
-  try { localStorage.setItem('token', t.trim()); } catch(e) {}
-  return api(method, path, body);
+// This page only loads after the browser's sign-in prompt, and the browser then
+// sends the same credentials with every request the page makes.
+function api(method, path, body){
+  return fetch(path, {method, headers: {'Content-Type':'application/json'}, body: body ? JSON.stringify(body) : undefined});
 }
 async function refresh(){
   const feeds = await (await fetch('/feeds')).json();
@@ -423,6 +420,15 @@ document.getElementById('subForm').onsubmit = async e => {
 refresh(); setInterval(refresh, 5000);
 </script>
 """
+
+
+def _is_public(path: str) -> bool:
+    """Routes a podcast app needs; everything else is behind the token."""
+    return (
+        path in ("/rss", "/feed", "/artwork.jpg", "/ping")
+        or path.startswith(("/rss/", "/audio/", "/thumb/"))
+        or (path.startswith("/chapters/") and path.endswith(".json"))
+    )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -512,6 +518,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
+        if not _is_public(path) and not self._authorized():
+            return
         if path == "/" or path == "/index.html":
             self._text(200, INDEX_HTML, "text/html; charset=utf-8")
         elif path == "/ping":
@@ -572,20 +580,35 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._text(404, "not found")
 
+    def _given_token(self) -> str:
+        """The token from a Bearer header, or the password of a Basic one."""
+        scheme, _, value = self.headers.get("Authorization", "").partition(" ")
+        if scheme.lower() == "bearer":
+            return value.strip()
+        if scheme.lower() == "basic":
+            try:
+                return base64.b64decode(value.strip(), validate=True).decode("utf-8").partition(":")[2]
+            except (binascii.Error, UnicodeDecodeError):
+                return ""
+        return ""
+
     def _authorized(self) -> bool:
         """True if no token is configured or the request carries it; otherwise answers 401."""
         if not API_TOKEN:
             return True
-        given = self.headers.get("Authorization", "").encode()
-        if hmac.compare_digest(given, f"Bearer {API_TOKEN}".encode()):
+        if hmac.compare_digest(self._given_token().encode(), API_TOKEN.encode()):
             return True
         self.send_response(401)
-        self.send_header("WWW-Authenticate", "Bearer")
+        # Only a page load gets the Basic challenge, which makes the browser ask
+        # for the token; scripts and extensions get a plain refusal.
+        wants_page = "text/html" in self.headers.get("Accept", "")
+        self.send_header("WWW-Authenticate", 'Basic realm="YouTube Podcast"' if wants_page else "Bearer")
         body = json.dumps({"error": "missing or wrong API token"}).encode()
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if not self._head_only:
+            self.wfile.write(body)
         return False
 
     def _read_json(self) -> dict | None:
@@ -663,7 +686,7 @@ def main():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     print(f"Serving on 0.0.0.0:{PORT} (public base: {PUBLIC_BASE_URL}, downloads: {DOWNLOAD_DIR})", flush=True)
     if not API_TOKEN:
-        print("WARNING: API_TOKEN is not set - anyone who can reach this server can add and delete", flush=True)
+        print("WARNING: API_TOKEN is not set - the admin page and API are open to anyone who can reach this server", flush=True)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     try:
         server.serve_forever()

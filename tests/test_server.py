@@ -1,5 +1,6 @@
 """Tests for the HTTP server and the on-disk episode handling. No network, no yt-dlp."""
 
+import base64
 import json
 import os
 import sys
@@ -86,6 +87,7 @@ def _request(url, method="GET", body=None, headers=None):
 
 
 AUTH = {"Authorization": "Bearer secret-token", "Content-Type": "application/json"}
+BASIC = {"Authorization": "Basic " + base64.b64encode(b"anyone:secret-token").decode()}
 
 
 # --- URL validation -----------------------------------------------------------
@@ -163,6 +165,7 @@ def test_range_head_and_path_checks(base_url):
     assert _request(f"{base_url}/rss/channel-a")[0] == 200
     assert _request(f"{base_url}/rss/nobody")[0] == 404
     assert _request(f"{base_url}/chapters/vid00000001.json")[0] == 404  # no chapters on this one
+    assert _request(f"{base_url}/rss/nobody")[0] == 404
 
 
 def test_write_endpoints_need_the_token(base_url):
@@ -175,9 +178,29 @@ def test_write_endpoints_need_the_token(base_url):
     wrong = {"Authorization": "Bearer nope", "Content-Type": "application/json"}
     assert _request(f"{base_url}/episodes/vid00000001", "DELETE", headers=wrong)[0] == 401
     assert len(server.list_episodes()) == 1
-    # reads stay open for podcast apps
-    assert _request(f"{base_url}/rss")[0] == 200
-    assert _request(f"{base_url}/episodes")[0] == 200
+
+
+def test_only_what_a_podcast_app_needs_is_public(base_url):
+    stem = _add_episode("vid00000001", "A1", "Channel A", 1000, chapters=[(0, "Intro")])
+    name = urllib.request.quote(stem)
+    for path in ("/rss", "/feed", "/rss/channel-a", "/artwork.jpg", "/ping",
+                 f"/audio/{name}.mp3", f"/thumb/{name}.jpg", "/chapters/vid00000001.json"):
+        assert _request(base_url + path)[0] == 200, path
+    for path in ("/", "/index.html", "/episodes", "/tasks", "/tasks/x", "/subscriptions",
+                 "/subscriptions/x", "/feeds", "/health", "/anything-else"):
+        assert _request(base_url + path)[0] == 401, path
+        assert _request(base_url + path, method="HEAD")[0] == 401, path
+    # a page load is asked to sign in; a script is just refused
+    status, headers, _ = _request(base_url + "/", headers={"Accept": "text/html,*/*"})
+    assert (status, headers["WWW-Authenticate"]) == (401, 'Basic realm="YouTube Podcast"')
+    assert _request(base_url + "/episodes")[1]["WWW-Authenticate"] == "Bearer"
+    # the token works as a Bearer header or as the Basic password
+    assert _request(base_url + "/", headers=BASIC)[0] == 200
+    assert _request(base_url + "/episodes", headers=AUTH)[0] == 200
+    assert _request(base_url + "/health", headers=BASIC)[0] == 200
+    wrong = {"Authorization": "Basic " + base64.b64encode(b"anyone:nope").decode()}
+    assert _request(base_url + "/", headers=wrong)[0] == 401
+    assert _request(base_url + "/", headers={"Authorization": "Basic !!!"})[0] == 401
 
 
 def test_bad_requests_are_rejected_before_anything_is_queued(base_url):
