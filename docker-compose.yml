@@ -8,6 +8,8 @@ services:
     # there, and nothing on the LAN can talk to the server over plain http.
     ports:
       - "172.17.0.1:5757:8080"
+    # uid:gid 1000 inside and out; the two data folders must belong to it.
+    user: "1000:1000"
     security_opt:
       - no-new-privileges:true
     cap_drop:

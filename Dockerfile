@@ -6,10 +6,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux \
-        -o /usr/local/bin/yt-dlp && chmod +x /usr/local/bin/yt-dlp
+# The server runs as an unprivileged user. yt-dlp lives in a folder that user owns
+# so it can still update itself at start.
+RUN useradd --uid 1000 --create-home app \
+    && mkdir -p /opt/yt-dlp /app/downloads /app/state \
+    && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux \
+        -o /opt/yt-dlp/yt-dlp && chmod +x /opt/yt-dlp/yt-dlp \
+    && chown -R app:app /opt/yt-dlp /app
+ENV PATH=/opt/yt-dlp:$PATH
 
 COPY rss_downloader.py tasks.py auth.py artwork.jpg ./
+USER app
 
 ENV PORT=8080 \
     DOWNLOAD_DIR=/app/downloads \

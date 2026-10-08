@@ -481,8 +481,10 @@ How it is built (`auth.py`, standard library only):
   fetch from inside your network. URLs are also passed to yt-dlp after `--`,
   so a request cannot inject yt-dlp options.
 - The container's port is published on the docker bridge address only
-  (`172.17.0.1:5757`), runs with all capabilities dropped and
-  `no-new-privileges`. Nothing on the LAN can reach it over plain http.
+  (`172.17.0.1:5757`). It runs as uid 1000 with all capabilities dropped and
+  `no-new-privileges`. Nothing on the LAN can reach it over plain http. The
+  two data folders must belong to uid 1000
+  (`sudo chown -R 1000:1000 /DATA/AppData/youtube-podcast-server`).
 - The feed and audio are public to anyone who knows the address.
 
 For more than this:
