@@ -265,9 +265,22 @@ def _publish(incoming_mp3: str) -> str | None:
     return os.path.join(DOWNLOAD_DIR, stem + ".mp3")
 
 
+def _clear_stale_audio() -> None:
+    """Drop mp3s left in INCOMING_DIR by an interrupted run.
+
+    yt-dlp treats an existing mp3 as a finished conversion and would hand back
+    the truncated file. Source downloads (.webm, .part) are kept so the retry
+    can resume. Only safe while a single worker runs at a time.
+    """
+    for fn in os.listdir(INCOMING_DIR):
+        if fn.lower().endswith(".mp3"):
+            os.remove(os.path.join(INCOMING_DIR, fn))
+
+
 def _ytdlp_single(url: str) -> str | None:
     """Download one video; returns the published mp3 path or None."""
     _ensure_dirs()
+    _clear_stale_audio()
     cmd = [
         "yt-dlp",
         *_ytdlp_common_args(),
@@ -289,6 +302,7 @@ def _ytdlp_playlist(url: str) -> list[str]:
     Uses ``--download-archive`` so previously-downloaded video IDs are skipped.
     """
     _ensure_dirs()
+    _clear_stale_audio()
     cmd = [
         "yt-dlp",
         *_ytdlp_common_args(),
