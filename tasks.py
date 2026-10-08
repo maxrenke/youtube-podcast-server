@@ -23,13 +23,16 @@ import subprocess
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from queue import Queue
 
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
 STATE_DIR = os.environ.get("STATE_DIR", "state")
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", str(60 * 60)))
 SCHEDULER_TICK_SECONDS = int(os.environ.get("SCHEDULER_TICK_SECONDS", "60"))
+
+# ID3 album tag written into every mp3; rss_downloader uses the same value as the feed title.
+FEED_TITLE = os.environ.get("FEED_TITLE", "YouTube Podcast")
 
 SUBSCRIPTIONS_FILE = os.path.join(STATE_DIR, "subscriptions.json")
 ARCHIVE_FILE = os.path.join(STATE_DIR, "archive.txt")
@@ -51,13 +54,18 @@ TYPE_SUBSCRIPTION = "subscription"
 
 
 def _now_iso() -> str:
-    return datetime.utcnow().isoformat() + "Z"
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
 
 
 def _sanitize(name: str) -> str:
     name = re.sub(r"[^\w\s.-]", "", name, flags=re.UNICODE)
     name = re.sub(r"\s+", "_", name).strip("._")
     return name[:120] or "untitled"
+
+
+def is_valid_url(url: str) -> bool:
+    """Only http(s) URLs are handed to yt-dlp; anything else could be read as an option."""
+    return bool(re.match(r"https?://[^\s]+$", url, flags=re.IGNORECASE))
 
 
 def _ensure_dirs() -> None:
@@ -199,22 +207,52 @@ def _enqueue_subscription_poll(sub: dict) -> str:
 # yt-dlp invocations
 # ---------------------------------------------------------------------------
 
+# Square, blurred-fill version of the 16:9 YouTube thumbnail: podcast apps expect square art.
+_SQUARE_THUMB = (
+    "ThumbnailsConvertor+ffmpeg_o:-filter_complex "
+    "[0:v]split[a][b];"
+    "[a]scale=1400:1400:force_original_aspect_ratio=increase,crop=1400:1400,boxblur=40:5[bg];"
+    "[b]scale=1400:-2[fg];"
+    "[bg][fg]overlay=(W-w)/2:(H-h)/2 -q:v 3"
+)
+
+
+def _ytdlp_common_args() -> list[str]:
+    """Options shared by single and playlist downloads.
+
+    Each episode ends up as three files with the same stem: ``.mp3`` (ID3 tags,
+    chapters and cover art embedded), ``.jpg`` (the same square cover, served at
+    ``/thumb/``) and ``.info.json`` (source of the RSS item metadata).
+    """
+    # "%(xx|literal)s" is yt-dlp's way to set a metadata field to a fixed string.
+    album = FEED_TITLE.replace("%", "").replace(")", "").replace("|", "")
+    return [
+        "-x",
+        "--audio-format", "mp3",
+        "--audio-quality", "0",
+        "--embed-metadata",
+        "--embed-chapters",
+        "--embed-thumbnail",
+        "--write-thumbnail",
+        "--convert-thumbnails", "jpg",
+        "--ppa", _SQUARE_THUMB,
+        "--parse-metadata", f"%(xx|{album})s:%(meta_album)s",
+        "--parse-metadata", "%(xx|Podcast)s:%(meta_genre)s",
+        "--write-info-json",
+    ]
+
+
 def _ytdlp_single(url: str, out_template: str) -> str | None:
     """Download one video; returns the final mp3 path or None."""
     cmd = [
         "yt-dlp",
-        "-x",
-        "--audio-format", "mp3",
-        "--audio-quality", "0",
-        "--embed-thumbnail",
-        "--add-metadata",
-        "--write-info-json",
+        *_ytdlp_common_args(),
         "--no-playlist",
         "-o", out_template,
         "--print", "after_move:filepath",
-        url,
+        "--", url,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * 60)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * 60, check=False)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "yt-dlp failed")
     out = proc.stdout.strip().splitlines()
@@ -229,20 +267,15 @@ def _ytdlp_playlist(url: str, out_template: str) -> list[str]:
     _ensure_dirs()
     cmd = [
         "yt-dlp",
-        "-x",
-        "--audio-format", "mp3",
-        "--audio-quality", "0",
-        "--embed-thumbnail",
-        "--add-metadata",
-        "--write-info-json",
+        *_ytdlp_common_args(),
         "--ignore-errors",
         "--yes-playlist",
         "--download-archive", ARCHIVE_FILE,
         "-o", out_template,
         "--print", "after_move:filepath",
-        url,
+        "--", url,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * 60 * 6)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * 60 * 6, check=False)
     # With --ignore-errors yt-dlp may exit non-zero even with partial success.
     # Capture printed filepaths regardless; surface stderr only if nothing landed.
     paths = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
@@ -312,7 +345,7 @@ def _worker() -> None:
             with TASKS_LOCK:
                 task["status"] = STATUS_DONE
                 task["ended"] = _now_iso()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - one bad task must not kill the worker
             with TASKS_LOCK:
                 task["status"] = STATUS_ERROR
                 task["error"] = (task.get("error") or str(e))[:2000]
@@ -336,7 +369,7 @@ def _scheduler() -> None:
                 # if the worker is slow.
                 _update_subscription(sub["id"], next_poll=now + sub["interval_seconds"])
                 _enqueue_subscription_poll(sub)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - keep the scheduler alive
             print(f"[scheduler] tick error: {e}", flush=True)
         time.sleep(SCHEDULER_TICK_SECONDS)
 

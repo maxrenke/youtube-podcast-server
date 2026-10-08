@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux \
         -o /usr/local/bin/yt-dlp && chmod +x /usr/local/bin/yt-dlp
 
-COPY rss_downloader.py tasks.py ./
+COPY rss_downloader.py tasks.py artwork.jpg ./
 
 ENV PORT=8080 \
     DOWNLOAD_DIR=/app/downloads \

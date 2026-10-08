@@ -5,7 +5,7 @@
 #         .\deploy.ps1 -Logs                 # also tail logs after rebuild
 #
 # Assumes:
-#   - origin remote is set (named `upstream` in this repo)
+#   - `origin` remote points at GitHub
 #   - SSH host alias `casaos` is configured
 #   - repo is at ~/youtube-podcast-server on the box
 
@@ -22,7 +22,7 @@ if ($Message) {
 }
 
 Write-Host "==> Pushing to GitHub..."
-git push upstream master
+git push origin master
 
 Write-Host "==> Pulling + rebuilding on casaos..."
 ssh casaos "cd ~/youtube-podcast-server && git pull --ff-only && docker compose up -d --build"
