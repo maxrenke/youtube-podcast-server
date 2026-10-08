@@ -169,6 +169,7 @@ def download_audio(youtube_url: str) -> None:
 youtube-podcast-server/
 |- rss_downloader.py      # HTTP server, RSS generation, inline UI
 |- tasks.py               # task queue, worker, scheduler, yt-dlp invocations
+|- auth.py                # admin account, sessions, two-step codes, throttling
 |- artwork.jpg            # podcast cover served at /artwork.jpg
 |- Dockerfile, docker-compose.yml, deploy.ps1
 |- readme.md              # user and API documentation

@@ -53,11 +53,38 @@ Still open:
 | J | Container runs as root; files in the data dirs are root-owned, so managing them on the host needs sudo. Not changed: the yt-dlp self-update at start writes to `/usr/local/bin` and needs root. | Low    |
 | N | Cloudflare's CDN terms restrict serving large media files through the proxy on non-Enterprise plans. One listener is unlikely to draw attention, but it is not a supported use - worth reading the current Service-Specific Terms. | Unknown |
 
+## Security audit 2026-10-08
+
+Scope: authentication and exposure of the public instance. Each finding was
+confirmed against the live site before the fix and re-tested after it.
+
+| # | Severity | Finding | Status |
+|---|----------|---------|--------|
+| S1 | High | **CSRF.** The admin page used HTTP Basic, which a browser attaches to requests triggered by other sites. A cross-site "simple" POST (`text/plain`, foreign `Origin`) to `/download` was accepted. | Fixed: session cookie with `SameSite=Strict`; cookie-authenticated writes need our `Origin`, a CSRF token and a JSON content type |
+| S2 | High | **The cloudflared WebUI (port 14333) hands the tunnel token to anyone on the LAN or tailnet** (`GET /config`, no login). With it someone can run their own connector for this tunnel and receive the site's traffic, sign-ins included. | **Open - not part of this repo.** Set `BASIC_AUTH_PASS` on that container or stop publishing the port, then rotate the tunnel token |
+| S3 | Medium | The login was one static shared secret typed into a browser prompt: no user, no lockout, no logout, same secret as the automation. | Fixed: password account (scrypt), optional TOTP, server-side sessions, logout; the API token is for scripts only |
+| S4 | Medium | No throttling: 40 wrong passwords in 5.5 s, all answered. | Fixed: 5 failures lock the client address out for 15 minutes |
+| S5 | Medium | Plain http was served (`http://podcast.maxrenke.com/feed` -> 200, the sign-in prompt too). | Fixed in the app: http is redirected or refused, HSTS sent. Also worth turning on "Always Use HTTPS" for the zone |
+| S6 | Medium | The server fetched any http(s) URL it was given, including addresses inside the home network (SSRF, reachable through S1). | Fixed: `ALLOWED_HOSTS`, YouTube only by default |
+| S7 | Medium | The origin was published on every interface over plain http (`casaos.local:5757`), so a token used there crossed the LAN in clear. | Fixed: bound to the docker bridge address only |
+| S8 | Low | No security headers at all; the admin page could be framed; no content policy. | Fixed: nosniff, frame denial, referrer policy, CSP with script nonce, `no-store` on signed-in responses |
+| S9 | Low | A double quote in a video description URL could close the `href` in the show notes sent to podcast apps. | Fixed |
+| S10 | Low | Container ran with default capabilities. | Fixed: `cap_drop: ALL`, `no-new-privileges`. Still root inside the container (finding J) |
+| S11 | Low | `Server` header named the Python version (hidden by Cloudflare, visible on the LAN). | Fixed |
+| S12 | Info | The feed and audio are readable by anyone who has or guesses the address (`/feed`, `/rss`). | Open by design. A secret path (`/f/<key>/feed`) would close it at the cost of re-following the feed in the app |
+| S13 | Info | A Cloudflare API token that can edit every zone on the account sits in a file on the PC and never expires. It was only needed for set-up. | **Open** - revoke it in the Cloudflare dashboard |
+| S14 | Info | yt-dlp is fetched unpinned at build time and self-updates at start. | Accepted: needed to keep YouTube working |
+
+Checked and found in order: TLS 1.2 and 1.3 only at the edge; no secrets in
+git history; token comparison is constant-time; path traversal on `/audio`
+and `/thumb` is refused; the extension keeps its token in extension storage
+and only talks to the configured server.
+
 ## Proposals - status
 
 | #   | Proposal                                   | Status 2026-10-08                                                                      |
 |-----|--------------------------------------------|----------------------------------------------------------------------------------------|
-| P1  | Token                                      | Done: `API_TOKEN` on everything except feeds, audio, covers, chapters; browser sign-in |
+| P1  | Sign-in                                    | Done: password account with optional two-step codes for people, `API_TOKEN` for scripts |
 | P2  | Delete from the UI                         | Done: `DELETE /episodes/<video_id>` + button                                           |
 | P3  | Retention                                  | Done: `KEEP_DAYS` / `KEEP_COUNT`, off by default                                       |
 | P4  | Persist the queue                          | Done: `STATE_DIR/tasks.json`, re-queue on start, one retry                             |

@@ -1,16 +1,18 @@
-import base64
-import binascii
 import hmac
 import html
+import ipaddress
 import json
 import os
 import re
+import secrets
 import time
 import xml.sax.saxutils as sx
 from email.utils import formatdate
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import quote, unquote
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
+import auth
 import tasks
 from tasks import (
     DOWNLOAD_DIR,
@@ -39,11 +41,17 @@ FEED_CATEGORY = os.environ.get("FEED_CATEGORY", "Technology")
 # episodes are other people's videos, so this feed is for personal use only.
 FEED_PRIVATE = os.environ.get("FEED_PRIVATE", "1").lower() not in ("0", "false", "no")
 ARTWORK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artwork.jpg")
-# When set, everything needs the token except what a podcast app fetches with no
-# login: the feeds, audio, covers and chapters (see _is_public). Scripts send
-# "Authorization: Bearer <API_TOKEN>"; a browser gets a Basic sign-in prompt
-# where the password is the token and the user name is ignored.
+# Everything needs a sign-in except what a podcast app fetches with no login:
+# the feeds, audio, covers and chapters (see _is_public). Two ways in:
+# - scripts send "Authorization: Bearer <API_TOKEN>";
+# - a person signs in at /login with the account created at /setup (auth.py),
+#   and the browser then carries a session cookie.
 API_TOKEN = os.environ.get("API_TOKEN", "")
+_ORIGIN = urlsplit(PUBLIC_BASE_URL)
+PUBLIC_ORIGIN = f"{_ORIGIN.scheme}://{_ORIGIN.netloc}"
+SECURE = _ORIGIN.scheme == "https"
+# The __Host- prefix makes browsers refuse the cookie unless it is Secure, host-only and Path=/.
+COOKIE_NAME = "__Host-ytps" if SECURE else "ytps"
 MAX_BODY_BYTES = 64 * 1024
 PORT = int(os.environ.get("PORT", "8080"))
 START_TIME = time.time()
@@ -162,7 +170,7 @@ def _description_text(ep) -> str:
 
 
 def _linkify(text: str) -> str:
-    escaped = html.escape(text, quote=False)
+    escaped = html.escape(text, quote=True)
     return re.sub(r"(https?://[^\s<]+)", r'<a href="\1">\1</a>', escaped)
 
 
@@ -312,8 +320,51 @@ def generate_rss(feed: str = "", path: str = "/rss"):
     return "\n".join(out)
 
 
+_PAGE = """<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__ - YouTube Podcast</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:360px;margin:12vh auto;padding:0 1rem}
+h1{font-size:1.3rem}
+label{display:block;margin:.8rem 0 .25rem;font-weight:600}
+input{font-size:1rem;padding:.5rem;width:100%;box-sizing:border-box}
+button{font-size:1rem;padding:.55rem 1rem;margin-top:1.1rem}
+.msg{padding:.6rem .8rem;border-radius:6px;background:#fee;border:1px solid #c66;color:#a00}
+.msg.ok{background:#efe;border-color:#6a6;color:#060}
+.muted{color:#666;font-size:.85em}
+</style>
+<h1>__TITLE__</h1>
+__BODY__
+</html>"""
+
+_LOGIN_FORM = """<form method="post" action="/login">
+<label for="u">User name</label><input id="u" name="username" autocomplete="username" required autofocus>
+<label for="p">Password</label><input id="p" name="password" type="password" autocomplete="current-password" required>
+<label for="c">Two-step code <span class="muted">(if turned on)</span></label>
+<input id="c" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="8">
+<button>Sign in</button>
+</form>"""
+
+_SETUP_FORM = """<p class="muted">Creates the admin account, or replaces it if you forgot the password.
+The API token proves you control the server; it is the API_TOKEN value in the server's .env file.</p>
+<form method="post" action="/setup">
+<label for="t">API token</label><input id="t" name="token" type="password" autocomplete="off" required>
+<label for="u">User name</label><input id="u" name="username" autocomplete="username" required>
+<label for="p">New password <span class="muted">(12 characters or more)</span></label>
+<input id="p" name="password" type="password" autocomplete="new-password" minlength="12" required>
+<label for="p2">New password again</label>
+<input id="p2" name="password2" type="password" autocomplete="new-password" minlength="12" required>
+<button>Save</button>
+</form>"""
+
+
+def _message(text: str, ok: bool = False) -> str:
+    return f'<p class="msg{" ok" if ok else ""}">{html.escape(text)}</p>' if text else ""
+
+
 INDEX_HTML = """<!doctype html>
 <meta charset="utf-8"><title>YouTube Podcast</title>
+<meta name="csrf" content="__CSRF__">
 <style>
 body{font-family:system-ui,sans-serif;max-width:820px;margin:2rem auto;padding:0 1rem}
 input,button{font-size:1rem;padding:.5rem}
@@ -330,6 +381,13 @@ h2{margin-top:1.5rem}
 </style>
 <h1><img src="/artwork.jpg" alt="" style="width:48px;height:48px;border-radius:8px;vertical-align:middle"> YouTube Podcast</h1>
 <p>Feed: <a id="feed" href="/feed">/feed</a> <span id="feeds" class="muted"></span></p>
+<div id="account" class="muted"></div>
+<div id="twostep" hidden>
+  <p>Add this key to an authenticator app, then enter the 6-digit code it shows.</p>
+  <p><code id="totpSecret"></code></p>
+  <p class="muted" id="totpUri" style="overflow-wrap:anywhere"></p>
+  <input id="totpCode" inputmode="numeric" maxlength="6" placeholder="123456" style="width:8rem"> <button id="totpConfirm">Confirm</button>
+</div>
 
 <h2>Download single video</h2>
 <form id="dlForm"><input id="dlUrl" placeholder="https://www.youtube.com/watch?v=..." required><button>Download</button></form>
@@ -344,7 +402,7 @@ h2{margin-top:1.5rem}
 <h2>Episodes</h2><div id="eps"></div>
 <h2>Recent tasks</h2><div id="tasks"></div>
 
-<script>
+<script nonce="__NONCE__">
 function fmtTs(s){ return s ? new Date(s).toLocaleString() : 'never'; }
 function esc(v){ return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function fmtDur(s){ s=Math.round(s||0); const h=Math.floor(s/3600), m=Math.floor(s%3600/60); return (h?h+'h ':'')+m+'m'; }
@@ -355,16 +413,49 @@ function fmtNext(ep){
   const m = Math.round(ms/60000);
   return m < 60 ? m+'m' : Math.round(m/60)+'h';
 }
-// This page only loads after the browser's sign-in prompt, and the browser then
-// sends the same credentials with every request the page makes.
+// The session cookie travels on its own; writes also carry the session's CSRF token.
+const CSRF = document.querySelector('meta[name=csrf]').content;
 function api(method, path, body){
-  return fetch(path, {method, headers: {'Content-Type':'application/json'}, body: body ? JSON.stringify(body) : undefined});
+  return fetch(path, {method, headers: {'Content-Type':'application/json', 'X-CSRF-Token': CSRF}, body: body ? JSON.stringify(body) : undefined});
 }
+async function getJson(path){
+  const r = await fetch(path);
+  if(r.status === 401){ location.href = '/login'; throw new Error('signed out'); }
+  return r.json();
+}
+function button(label, onclick){ const b = document.createElement('button'); b.textContent = label; b.onclick = onclick; return b; }
+async function account(){
+  const a = await getJson('/account'), box = document.getElementById('account');
+  box.textContent = '';
+  if(!a.username){ box.textContent = 'Using the API token. '; return; }
+  box.append('Signed in as ' + a.username + '. Two-step sign-in is ' + (a.two_step ? 'on. ' : 'off. '));
+  box.append(a.two_step
+    ? button('Turn off', async () => {
+        const password = prompt('Your password, to turn two-step sign-in off:');
+        if(password === null) return;
+        const r = await api('POST', '/account/totp', {action: 'disable', password});
+        if(!r.ok) alert((await r.json()).error);
+        account();
+      })
+    : button('Turn on', async () => {
+        const r = await (await api('POST', '/account/totp', {action: 'start'})).json();
+        document.getElementById('totpSecret').textContent = r.secret;
+        document.getElementById('totpUri').textContent = r.uri;
+        document.getElementById('twostep').hidden = false;
+      }));
+  box.append(' ', button('Log out', async () => { await api('POST', '/logout'); location.href = '/login'; }));
+}
+document.getElementById('totpConfirm').onclick = async () => {
+  const r = await api('POST', '/account/totp', {action: 'confirm', code: document.getElementById('totpCode').value});
+  if(!r.ok){ alert((await r.json()).error); return; }
+  document.getElementById('twostep').hidden = true;
+  account();
+};
 async function refresh(){
-  const feeds = await (await fetch('/feeds')).json();
+  const feeds = await getJson('/feeds');
   document.getElementById('feeds').innerHTML = feeds.length ? ' - per channel: ' + feeds.map(f =>
     `<a href="${esc(f.url)}">${esc(f.title)}</a> (${f.episodes})`).join(', ') : '';
-  const eps = await (await fetch('/episodes')).json();
+  const eps = await getJson('/episodes');
   document.getElementById('eps').innerHTML = eps.map(e =>
     `<div class="ep">${e.thumbnail ? `<img src="${esc(e.thumbnail)}" alt="" loading="lazy">` : ''}
      <div style="flex:1;min-width:0"><b>${esc(e.title)}</b><br>
@@ -373,7 +464,7 @@ async function refresh(){
      <audio controls preload="none" src="/audio/${encodeURIComponent(e.filename)}"></audio></div>
      <div><button class="danger" data-del-episode="${esc(e.video_id)}" data-title="${esc(e.title)}">Delete</button></div></div>`).join('') || '<p class="muted">no episodes yet</p>';
 
-  const subs = await (await fetch('/subscriptions')).json();
+  const subs = await getJson('/subscriptions');
   document.getElementById('subs').innerHTML = subs.map(s => {
     const last = s.last_result ? (s.last_result.ok ? `+${s.last_result.new||0} new` : `error: ${s.last_result.error}`) : '-';
     return `<div class="sub row">
@@ -385,7 +476,7 @@ async function refresh(){
     </div>`;
   }).join('') || '<p class="muted">no subscriptions</p>';
 
-  const ts = await (await fetch('/tasks')).json();
+  const ts = await getJson('/tasks');
   document.getElementById('tasks').innerHTML = ts.slice(-25).reverse().map(t =>
     `<div class="muted">[${esc(t.status)}] (${esc(t.type)}) ${esc(t.url)} ${t.error?'- '+esc(t.error):''} ${t.downloaded&&t.downloaded.length?'- pulled '+t.downloaded.length:''}</div>`).join('') || '<p class="muted">no tasks</p>';
 }
@@ -417,7 +508,7 @@ document.getElementById('subForm').onsubmit = async e => {
   document.getElementById('subUrl').value='';
   refresh();
 };
-refresh(); setInterval(refresh, 5000);
+account(); refresh(); setInterval(refresh, 5000);
 </script>
 """
 
@@ -431,8 +522,106 @@ def _is_public(path: str) -> bool:
     )
 
 
+def auth_enabled() -> bool:
+    return bool(API_TOKEN) or auth.load_account() is not None
+
+
 class Handler(BaseHTTPRequestHandler):
+    timeout = 60  # seconds a connection may sit idle
+    server_version = "ytps"  # no Python or library versions in the Server header
+    sys_version = ""
     _head_only = False  # set by do_HEAD: send headers, skip the body
+    _private = False  # set when the response depends on who is asking
+
+    def end_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        # same-origin (not no-referrer) so our own form posts keep their Origin header
+        self.send_header("Referrer-Policy", "same-origin")
+        if SECURE:
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
+        if self._private:
+            self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
+    def _client(self) -> str:
+        """The caller's address. Behind the tunnel the peer is cloudflared, which
+        passes the real one in CF-Connecting-IP; a direct peer cannot set it."""
+        peer = self.client_address[0]
+        try:
+            via_proxy = ipaddress.ip_address(peer).is_private or ipaddress.ip_address(peer).is_loopback
+        except ValueError:
+            via_proxy = False
+        forwarded = self.headers.get("CF-Connecting-IP", "").strip()
+        return forwarded if via_proxy and forwarded else peer
+
+    def _html(self, code, page, extra_headers=()):
+        """Send a page with a per-response script nonce and a strict content policy."""
+        nonce = secrets.token_urlsafe(16)
+        body = page.replace("__NONCE__", nonce).encode("utf-8")
+        self._private = True
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header(
+            "Content-Security-Policy",
+            f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; img-src 'self'; "
+            "media-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+        )
+        for name, value in extra_headers:
+            self.send_header(name, value)
+        self.end_headers()
+        if not self._head_only:
+            self.wfile.write(body)
+
+    def _form_page(self, code, title, body, extra_headers=()):
+        self._html(code, _PAGE.replace("__TITLE__", title).replace("__BODY__", body), extra_headers)
+
+    def _redirect(self, location, cookie=None):
+        self._private = True
+        self.send_response(303)
+        self.send_header("Location", location)
+        if cookie is not None:
+            self.send_header("Set-Cookie", cookie)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _cookie(self, session_id, max_age):
+        secure = "; Secure" if SECURE else ""
+        return f"{COOKIE_NAME}={session_id}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure}"
+
+    def _session_id(self) -> str:
+        try:
+            morsel = SimpleCookie(self.headers.get("Cookie", "")).get(COOKIE_NAME)
+        except CookieError:
+            return ""
+        return morsel.value if morsel else ""
+
+    def _insecure(self) -> bool:
+        """Refuse plain http when the site is https: redirect a read, reject anything else."""
+        if not SECURE or self.headers.get("X-Forwarded-Proto", "").lower() != "http":
+            return False
+        if self.command in ("GET", "HEAD"):
+            self.send_response(308)
+            self.send_header("Location", PUBLIC_BASE_URL + self.path)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            self._json(400, {"error": "use https"})
+        return True
+
+    def _refuse(self, code, error, retry_after=0) -> bool:
+        self._private = True
+        body = json.dumps({"error": error}).encode()
+        self.send_response(code)
+        if retry_after:
+            self.send_header("Retry-After", str(retry_after))
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if not self._head_only:
+            self.wfile.write(body)
+        return False
 
     def log_message(self, fmt, *args):
         print(f"[{self.log_date_time_string()}] {fmt % args}", flush=True)
@@ -517,11 +706,33 @@ class Handler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
+        if self._insecure():
+            return
+        path, _, query = self.path.partition("?")
+        if path == "/login":
+            note = parse_qs(query, keep_blank_values=True)
+            if auth.load_account() is None:
+                body = _message("No admin account yet.") + '<p><a href="/setup">Create it</a></p>'
+            else:
+                body = (_message("Wrong user name, password or code." if "e" in note else "")
+                        + _message("Account saved. Sign in." if "s" in note else "", ok=True) + _LOGIN_FORM)
+            self._form_page(200, "Sign in", body)
+            return
+        if path == "/setup":
+            self._form_page(200, "Set up the admin account", _SETUP_FORM)
+            return
         if not _is_public(path) and not self._authorized():
             return
         if path == "/" or path == "/index.html":
-            self._text(200, INDEX_HTML, "text/html; charset=utf-8")
+            session = auth.get_session(self._session_id())
+            self._html(200, INDEX_HTML.replace("__CSRF__", session["csrf"] if session else ""))
+        elif path == "/account":
+            session = auth.get_session(self._session_id())
+            account = auth.load_account() or {}
+            self._json(200, {
+                "username": session["username"] if session else "",
+                "two_step": bool(account.get("totp")),
+            })
         elif path == "/ping":
             self._json(200, {"message": "pong"})
         elif path == "/health":
@@ -580,36 +791,135 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._text(404, "not found")
 
-    def _given_token(self) -> str:
-        """The token from a Bearer header, or the password of a Basic one."""
-        scheme, _, value = self.headers.get("Authorization", "").partition(" ")
-        if scheme.lower() == "bearer":
-            return value.strip()
-        if scheme.lower() == "basic":
-            try:
-                return base64.b64decode(value.strip(), validate=True).decode("utf-8").partition(":")[2]
-            except (binascii.Error, UnicodeDecodeError):
-                return ""
-        return ""
+    def _authorized(self, write: bool = False) -> bool:
+        """True if the request may proceed; otherwise the refusal has been sent.
 
-    def _authorized(self) -> bool:
-        """True if no token is configured or the request carries it; otherwise answers 401."""
+        A Bearer token is accepted as is. A session cookie is enough to read;
+        to write it must also come from our own page (matching Origin, the
+        session's CSRF token, a JSON body), because a browser attaches cookies
+        to requests that other sites trigger.
+        """
+        if not auth_enabled():
+            return True
+        self._private = True
+        client = self._client()
+        scheme, _, value = self.headers.get("Authorization", "").partition(" ")
+        if scheme.lower() == "bearer" and API_TOKEN:
+            wait = auth.locked_for(client)
+            if wait:
+                return self._refuse(429, f"too many failed attempts; try again in {wait} s", wait)
+            if hmac.compare_digest(value.strip().encode(), API_TOKEN.encode()):
+                return True
+            auth.record_failure(client)
+            print(f"[auth] wrong API token from {client}", flush=True)
+            return self._refuse(401, "missing or wrong API token")
+        session = auth.get_session(self._session_id())
+        if session:
+            if not write:
+                return True
+            content_type = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
+            if (self.headers.get("Origin") == PUBLIC_ORIGIN
+                    and hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), session["csrf"])
+                    and content_type == "application/json"):
+                return True
+            print(f"[auth] cross-site write refused from {client} (Origin {self.headers.get('Origin')})", flush=True)
+            return self._refuse(403, "cross-site request refused")
+        if self.command == "GET" and "text/html" in self.headers.get("Accept", ""):
+            self._redirect("/login")
+            return False
+        return self._refuse(401, "sign in, or send the API token")
+
+    def _read_form(self) -> dict | None:
+        """A urlencoded form body as a dict, or None after answering with an error."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if length < 0 or length > MAX_BODY_BYTES:
+            self._form_page(413, "Too large", "")
+            return None
+        # A browser always names the page a form was posted from; if it is not ours, stop.
+        origin = self.headers.get("Origin")
+        if origin is not None and origin != PUBLIC_ORIGIN:
+            self._form_page(403, "Refused", _message("This form was not sent from this site."))
+            return None
+        fields = parse_qs(self.rfile.read(length).decode("utf-8", "replace"), keep_blank_values=True)
+        return {name: values[0] for name, values in fields.items()}
+
+    def _locked_page(self, client) -> bool:
+        wait = auth.locked_for(client)
+        if wait:
+            self._form_page(429, "Too many attempts",
+                            _message(f"Try again in {wait // 60 + 1} minutes."), [("Retry-After", str(wait))])
+        return bool(wait)
+
+    def _login(self):
+        client = self._client()
+        form = self._read_form()
+        if form is None or self._locked_page(client):
+            return
+        username = form.get("username", "")
+        if auth.check_login(username, form.get("password", ""), form.get("code", "")):
+            auth.clear_failures(client)
+            print(f"[auth] sign-in from {client}", flush=True)
+            self._redirect("/", self._cookie(auth.create_session(username.strip()), auth.SESSION_MAX_SECONDS))
+        else:
+            auth.record_failure(client)
+            print(f"[auth] failed sign-in from {client}", flush=True)
+            self._redirect("/login?e")
+
+    def _setup(self):
+        client = self._client()
+        form = self._read_form()
+        if form is None or self._locked_page(client):
+            return
         if not API_TOKEN:
-            return True
-        if hmac.compare_digest(self._given_token().encode(), API_TOKEN.encode()):
-            return True
-        self.send_response(401)
-        # Only a page load gets the Basic challenge, which makes the browser ask
-        # for the token; scripts and extensions get a plain refusal.
-        wants_page = "text/html" in self.headers.get("Accept", "")
-        self.send_header("WWW-Authenticate", 'Basic realm="YouTube Podcast"' if wants_page else "Bearer")
-        body = json.dumps({"error": "missing or wrong API token"}).encode()
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        if not self._head_only:
-            self.wfile.write(body)
-        return False
+            self._form_page(403, "Set up the admin account", _message("Set API_TOKEN on the server first."))
+            return
+        if not hmac.compare_digest(form.get("token", "").strip().encode(), API_TOKEN.encode()):
+            auth.record_failure(client)
+            print(f"[auth] failed account setup from {client}", flush=True)
+            self._form_page(403, "Set up the admin account", _message("Wrong API token.") + _SETUP_FORM)
+            return
+        username, password = form.get("username", ""), form.get("password", "")
+        problem = auth.password_problem(username, password)
+        if not problem and password != form.get("password2", ""):
+            problem = "The two passwords are not the same."
+        if problem:
+            self._form_page(400, "Set up the admin account", _message(problem) + _SETUP_FORM)
+            return
+        auth.set_account(username, password)
+        print(f"[auth] admin account set from {client}", flush=True)
+        self._redirect("/login?s")
+
+    def _two_step(self, data):
+        session = auth.get_session(self._session_id())
+        account = auth.load_account()
+        if not session or not account:
+            self._json(400, {"error": "sign in with the browser to change two-step sign-in"})
+            return
+        action = data.get("action")
+        if action == "start":
+            session["pending_totp"] = auth.new_totp_secret()
+            self._json(200, {"secret": session["pending_totp"],
+                             "uri": auth.totp_uri(session["pending_totp"], account["username"])})
+        elif action == "confirm":
+            secret = session.get("pending_totp")
+            if not secret or auth.matching_totp_counter(secret, str(data.get("code", ""))) is None:
+                self._json(400, {"error": "that code is not right; check the key and the phone's clock"})
+                return
+            auth.set_totp(secret)
+            session.pop("pending_totp", None)
+            self._json(200, {"two_step": True})
+        elif action == "disable":
+            if not auth.verify_password(str(data.get("password", "")), account["password"]):
+                auth.record_failure(self._client())
+                self._json(403, {"error": "wrong password"})
+                return
+            auth.set_totp(None)
+            self._json(200, {"two_step": False})
+        else:
+            self._json(400, {"error": "unknown action"})
 
     def _read_json(self) -> dict | None:
         try:
@@ -630,15 +940,35 @@ class Handler(BaseHTTPRequestHandler):
         return data
 
     def do_POST(self):
-        if not self._authorized():
+        if self._insecure():
             return
-        if self.path == "/download":
+        if self.path == "/login":
+            self._login()
+            return
+        if self.path == "/setup":
+            self._setup()
+            return
+        if not self._authorized(write=True):
+            return
+        if self.path == "/logout":
+            auth.destroy_session(self._session_id())
+            self.send_response(200)
+            self.send_header("Set-Cookie", self._cookie("", 0))
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+        elif self.path == "/account/totp":
+            data = self._read_json()
+            if data is not None:
+                self._two_step(data)
+        elif self.path == "/download":
             data = self._read_json()
             if data is None:
                 return
             url = (data.get("url") or "").strip()
             if not is_valid_url(url):
-                self._json(400, {"error": "url must start with http:// or https://"})
+                self._json(400, {"error": tasks.URL_RULE})
                 return
             task_id = enqueue_download(url)
             self._json(202, {"task_id": task_id})
@@ -648,7 +978,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             url = (data.get("url") or "").strip()
             if not is_valid_url(url):
-                self._json(400, {"error": "url must start with http:// or https://"})
+                self._json(400, {"error": tasks.URL_RULE})
                 return
             try:
                 sub = add_subscription(
@@ -664,7 +994,7 @@ class Handler(BaseHTTPRequestHandler):
             self._text(404, "not found")
 
     def do_DELETE(self):
-        if not self._authorized():
+        if self._insecure() or not self._authorized(write=True):
             return
         if self.path.startswith("/episodes/"):
             video_id = unquote(self.path[len("/episodes/"):])
@@ -685,8 +1015,10 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     print(f"Serving on 0.0.0.0:{PORT} (public base: {PUBLIC_BASE_URL}, downloads: {DOWNLOAD_DIR})", flush=True)
-    if not API_TOKEN:
-        print("WARNING: API_TOKEN is not set - the admin page and API are open to anyone who can reach this server", flush=True)
+    if not auth_enabled():
+        print("WARNING: no API_TOKEN and no admin account - the admin page and API are open to anyone who can reach this server", flush=True)
+    elif auth.load_account() is None:
+        print(f"No admin account yet: create it at {PUBLIC_BASE_URL}/setup", flush=True)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     try:
         server.serve_forever()

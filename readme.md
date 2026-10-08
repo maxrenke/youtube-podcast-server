@@ -34,8 +34,9 @@ re-polled on a schedule so new uploads get pulled automatically.
   PocketCasts, Overcast, Apple Podcasts, AntennaPod, etc.
 - **Tiny built-in UI** at `/` for submitting URLs, browsing and deleting
   episodes, managing subscriptions, and watching task status.
-- **Private admin page and API** - with `API_TOKEN` set, only the feeds,
-  audio, covers and chapters are reachable without the token.
+- **Private admin page and API** - only the feeds, audio, covers and chapters
+  are reachable without signing in. People use a password (scrypt-hashed)
+  with optional two-step codes; scripts use an API token.
 - **A feed per channel** - `/rss/<channel-slug>` next to the all-in-one `/rss`.
 - **Firefox extension** - add the video or subscribe to the channel you are
   looking at from the toolbar or the right-click menu. See
@@ -81,6 +82,7 @@ All via env vars. Defaults shown.
 | `KEEP_DAYS`               | `0`                              | Delete episodes added more than this many days ago. 0 = off.                         |
 | `KEEP_COUNT`              | `0`                              | Keep only this many newest episodes. 0 = off.                                        |
 | `RETRY_DELAY_SECONDS`     | `60`                             | Wait before the one retry of a failed single download.                               |
+| `ALLOWED_HOSTS`           | `youtube.com,youtu.be,youtube-nocookie.com` | Sites a download or subscription may point at (host or any subdomain). `*` = any. |
 | `TZ`                      | unset                            | Timezone for the container's logs.                                                   |
 
 **`PUBLIC_BASE_URL` matters.** If your phone is on a different network than
@@ -90,20 +92,22 @@ nginx + Let's Encrypt - whatever).
 
 ## HTTP API
 
-**Authentication.** When `API_TOKEN` is set, everything needs the token
-except what a podcast app fetches without a login:
+**Authentication.** Everything needs a sign-in except what a podcast app
+fetches without one:
 
-| Public                                                        | Needs the token                                      |
+| Public                                                        | Needs a sign-in                                      |
 |---------------------------------------------------------------|------------------------------------------------------|
 | `/rss`, `/feed`, `/rss/<slug>`                                | `/` (the admin page)                                 |
-| `/audio/*`, `/thumb/*`, `/artwork.jpg`                        | `/episodes`, `/tasks`, `/subscriptions`, `/feeds`, `/health` |
-| `/chapters/<id>.json`, `/ping`                                | every `POST` and `DELETE`                            |
+| `/audio/*`, `/thumb/*`, `/artwork.jpg`                        | `/episodes`, `/tasks`, `/subscriptions`, `/feeds`, `/health`, `/account` |
+| `/chapters/<id>.json`, `/ping`, `/login`, `/setup`            | every `POST` and `DELETE`                            |
 
-Scripts send `Authorization: Bearer <token>`. A browser opening the admin
-page gets a sign-in prompt: leave the user name empty (or type anything) and
-give the token as the password. Without a valid token the answer is
-`401 {"error": "missing or wrong API token"}`. The curl examples below omit
-the header for brevity: add `-H "Authorization: Bearer $API_TOKEN"`.
+There are two ways in:
+
+- **Scripts** (the PowerShell client, the Firefox extension, curl) send
+  `Authorization: Bearer <API_TOKEN>`. The curl examples below omit the header
+  for brevity.
+- **People** sign in at `/login` with a user name and password, plus a
+  two-step code if that is turned on. See [Signing in](#signing-in).
 
 Anyone who has the feed address can read the feed and download the audio -
 that is what lets a podcast app work - so treat the address itself as
@@ -446,14 +450,42 @@ Cloudflare Tunnel (`casaos`) to `http://172.17.0.1:5757`.
   delete files from `DOWNLOAD_DIR` (they vanish from `/rss` on next request)
   or add your own retention cronjob.
 
+## Signing in
+
+**First time, or after forgetting the password:** open `/setup`, enter the API
+token (the `API_TOKEN` value in the server's `.env`), a user name and a
+password of 12 characters or more. Doing this again replaces the account,
+signs out every session and turns two-step sign-in off.
+
+**Two-step sign-in:** on the admin page choose *Turn on*, add the key to an
+authenticator app, and confirm with the code it shows. From then on `/login`
+needs the code as well. Turning it off asks for the password.
+
+How it is built (`auth.py`, standard library only):
+
+| Part            | Detail                                                                                   |
+|-----------------|------------------------------------------------------------------------------------------|
+| Password        | scrypt (N=2^15, r=8, p=1), random 16-byte salt, in `STATE_DIR/auth.json` (mode 600). A wrong user name costs the same time as a wrong password. |
+| Session         | Random 256-bit id in a cookie: `__Host-` prefix, `Secure`, `HttpOnly`, `SameSite=Strict`. The server keeps only its SHA-256. 12 h idle limit, 7 days at most; a restart signs everyone out. |
+| Cross-site requests | A cookie-authenticated write must carry our own `Origin`, the session's `X-CSRF-Token` and a JSON content type. The sign-in and set-up forms refuse a foreign `Origin`. |
+| Two-step codes  | TOTP (RFC 6238, SHA-1, 6 digits, 30 s), one step of clock drift allowed, each code accepted once. |
+| Throttling      | 5 failures (password, code, API token or set-up token) lock that client address out for 15 minutes (`429` with `Retry-After`). The address comes from `CF-Connecting-IP` when the request arrives through the tunnel. |
+| Transport       | Plain http through the tunnel is redirected (reads) or refused (everything else); `Strict-Transport-Security` on every response. |
+| Headers         | `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: same-origin`; pages carry a Content-Security-Policy with a per-response script nonce; signed-in responses are `Cache-Control: no-store`. |
+| Logging         | Sign-ins, failures and refused cross-site writes are logged with the client address, never with a secret. |
+
 ## Security
 
-Set `API_TOKEN`. Without it anyone who can reach the server can open the
-admin page, queue downloads, delete episodes and change subscriptions. With
-it, only the feeds, audio, covers and chapters are public (see the table
-under HTTP API). Request URLs are restricted to `http(s)://` and passed to
-yt-dlp after `--`, so a request cannot inject yt-dlp options. For more than
-a shared secret:
+- The server only fetches from the sites in `ALLOWED_HOSTS` (YouTube by
+  default; `*` for any). Without that limit a request could make the box
+  fetch from inside your network. URLs are also passed to yt-dlp after `--`,
+  so a request cannot inject yt-dlp options.
+- The container's port is published on the docker bridge address only
+  (`172.17.0.1:5757`), runs with all capabilities dropped and
+  `no-new-privileges`. Nothing on the LAN can reach it over plain http.
+- The feed and audio are public to anyone who knows the address.
+
+For more than this:
 
 - Put it behind Cloudflare Access (Zero Trust), an OAuth proxy
   (oauth2-proxy), or basic auth via your reverse proxy.

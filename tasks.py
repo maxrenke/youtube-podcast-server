@@ -29,6 +29,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from queue import Queue
+from urllib.parse import urlsplit
 
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
 STATE_DIR = os.environ.get("STATE_DIR", "state")
@@ -43,6 +44,13 @@ SUB_MAX_ITEMS = int(os.environ.get("SUB_MAX_ITEMS", "10"))
 KEEP_DAYS = int(os.environ.get("KEEP_DAYS", "0"))
 KEEP_COUNT = int(os.environ.get("KEEP_COUNT", "0"))
 RETRY_DELAY_SECONDS = int(os.environ.get("RETRY_DELAY_SECONDS", "60"))
+# Sites a download or subscription may point at (the host or any subdomain). "*" = any site.
+ALLOWED_HOSTS = [
+    h.strip().lower()
+    for h in os.environ.get("ALLOWED_HOSTS", "youtube.com,youtu.be,youtube-nocookie.com").split(",")
+    if h.strip()
+]
+URL_RULE = "url must be an http(s) address on an allowed site (" + ", ".join(ALLOWED_HOSTS) + ")"
 MAX_ATTEMPTS = 2
 TASK_HISTORY = 200
 
@@ -88,8 +96,21 @@ def _now_iso() -> str:
 
 
 def is_valid_url(url: str) -> bool:
-    """Only http(s) URLs are handed to yt-dlp; anything else could be read as an option."""
-    return bool(re.match(r"https?://[^\s]+$", url, flags=re.IGNORECASE))
+    """Only http(s) URLs on an allowed site are handed to yt-dlp.
+
+    Anything not starting with http(s):// could be read as an option, and an
+    unrestricted host would let a request make this box fetch from inside the
+    home network.
+    """
+    if not re.match(r"https?://[^\s]+$", url, flags=re.IGNORECASE):
+        return False
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if "*" in ALLOWED_HOSTS:
+        return bool(host)
+    return any(host == allowed or host.endswith("." + allowed) for allowed in ALLOWED_HOSTS)
 
 
 def _ensure_dirs() -> None:

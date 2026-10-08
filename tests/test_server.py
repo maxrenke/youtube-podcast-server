@@ -1,13 +1,14 @@
 """Tests for the HTTP server and the on-disk episode handling. No network, no yt-dlp."""
 
-import base64
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from http.server import ThreadingHTTPServer
@@ -25,6 +26,7 @@ os.environ.update(
 )
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import auth
 import rss_downloader as server
 import tasks
 
@@ -65,6 +67,10 @@ def clean_downloads():
         if os.path.isfile(path):
             os.remove(path)
     server._EPISODE_CACHE.update(key=None, items=[])
+    if os.path.exists(auth.AUTH_FILE):
+        os.remove(auth.AUTH_FILE)
+    auth._SESSIONS.clear()
+    auth._FAILURES.clear()
     yield
 
 
@@ -76,23 +82,52 @@ def base_url():
     httpd.shutdown()
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None  # hand 3xx answers back instead of following them
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _request(url, method="GET", body=None, headers=None):
     data = json.dumps(body).encode() if isinstance(body, (dict, list)) else body
     req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with _OPENER.open(req, timeout=10) as r:
             return r.status, dict(r.headers), r.read()
     except urllib.error.HTTPError as e:
         return e.code, dict(e.headers), e.read()
 
 
+def _form(url, fields, headers=None):
+    head = {"Content-Type": "application/x-www-form-urlencoded", "Origin": ORIGIN, **(headers or {})}
+    return _request(url, "POST", urllib.parse.urlencode(fields).encode(), head)
+
+
+ORIGIN = "https://pod.example"
+PASSWORD = "correct horse battery staple"
+
+
+def _sign_in(base_url, client="198.51.100.1"):
+    """Create the account, sign in, and return the headers a browser would then send."""
+    auth.set_account("max", PASSWORD)
+    status, headers, _ = _form(base_url + "/login", {"username": "max", "password": PASSWORD},
+                               {"CF-Connecting-IP": client})
+    assert (status, headers["Location"]) == (303, "/")
+    cookie = headers["Set-Cookie"]
+    session = {"Cookie": cookie.split(";")[0], "CF-Connecting-IP": client}
+    page = _request(base_url + "/", headers=session)[2].decode()
+    csrf = re.search(r'<meta name="csrf" content="([^"]+)">', page).group(1)
+    return cookie, session, {**session, "Origin": ORIGIN, "X-CSRF-Token": csrf, "Content-Type": "application/json"}
+
+
 AUTH = {"Authorization": "Bearer secret-token", "Content-Type": "application/json"}
-BASIC = {"Authorization": "Basic " + base64.b64encode(b"anyone:secret-token").decode()}
 
 
 # --- URL validation -----------------------------------------------------------
 
-@pytest.mark.parametrize("url", ["https://youtu.be/abc", "http://example.com/x?y=1"])
+@pytest.mark.parametrize("url", ["https://youtu.be/abc", "https://www.youtube.com/watch?v=1", "http://m.youtube.com/x"])
 def test_valid_urls(url):
     assert tasks.is_valid_url(url)
 
@@ -100,6 +135,16 @@ def test_valid_urls(url):
 @pytest.mark.parametrize("url", ["", "--exec=touch /tmp/x", "-x", "ftp://host/x", "https://a b", "javascript:1"])
 def test_urls_that_could_be_options_are_rejected(url):
     assert not tasks.is_valid_url(url)
+
+
+@pytest.mark.parametrize("url", [
+    "http://192.168.1.1/admin", "http://localhost:8080/x", "https://example.com/v.mp4",
+    "https://youtube.com.evil.example/x", "https://notyoutube.com/x", "https://youtu.be@evil.example/x",
+])
+def test_only_allowed_sites_are_fetched(url, monkeypatch):
+    assert not tasks.is_valid_url(url)
+    monkeypatch.setattr(tasks, "ALLOWED_HOSTS", ["*"])
+    assert tasks.is_valid_url(url)
 
 
 # --- feed ---------------------------------------------------------------------
@@ -121,6 +166,9 @@ def test_feed_is_well_formed_and_carries_episode_metadata():
     notes = item.findtext("content:encoded", namespaces=NS)
     assert '<a href="https://example.com/a?b=1&amp;c=2">' in notes
     assert "<script>" not in notes and "&lt;script&gt;" in notes
+    # a quote in a described URL must not be able to close the href attribute
+    assert server._linkify('https://x.test/"onmouseover="alert(1)') == (
+        '<a href="https://x.test/&quot;onmouseover=&quot;alert(1)">https://x.test/&quot;onmouseover=&quot;alert(1)</a>')
     assert "<li>1:05 Part 2</li>" in notes
     assert item.find("podcast:chapters", NS).get("url") == "https://pod.example/chapters/vid00000002.json"
     assert items[1].find("podcast:chapters", NS) is None
@@ -190,17 +238,135 @@ def test_only_what_a_podcast_app_needs_is_public(base_url):
                  "/subscriptions/x", "/feeds", "/health", "/anything-else"):
         assert _request(base_url + path)[0] == 401, path
         assert _request(base_url + path, method="HEAD")[0] == 401, path
-    # a page load is asked to sign in; a script is just refused
+    # a page load is sent to the sign-in page; a script is just refused
     status, headers, _ = _request(base_url + "/", headers={"Accept": "text/html,*/*"})
-    assert (status, headers["WWW-Authenticate"]) == (401, 'Basic realm="YouTube Podcast"')
-    assert _request(base_url + "/episodes")[1]["WWW-Authenticate"] == "Bearer"
-    # the token works as a Bearer header or as the Basic password
-    assert _request(base_url + "/", headers=BASIC)[0] == 200
+    assert (status, headers["Location"]) == (303, "/login")
+    assert "WWW-Authenticate" not in _request(base_url + "/episodes")[1]
     assert _request(base_url + "/episodes", headers=AUTH)[0] == 200
-    assert _request(base_url + "/health", headers=BASIC)[0] == 200
-    wrong = {"Authorization": "Basic " + base64.b64encode(b"anyone:nope").decode()}
-    assert _request(base_url + "/", headers=wrong)[0] == 401
-    assert _request(base_url + "/", headers={"Authorization": "Basic !!!"})[0] == 401
+    # the token is not a password: HTTP Basic is not accepted
+    assert _request(base_url + "/", headers={"Authorization": "Basic OnNlY3JldC10b2tlbg=="})[0] == 401
+
+
+def test_security_headers_and_https_only(base_url):
+    stem = _add_episode("vid00000001", "A1", "Channel A", 1000)
+    public = _request(base_url + "/feed")[1]
+    assert public["X-Content-Type-Options"] == "nosniff"
+    assert public["X-Frame-Options"] == "DENY"
+    assert public["Strict-Transport-Security"] == "max-age=31536000"
+    assert "Python" not in public["Server"]
+    assert "Cache-Control" not in _request(f"{base_url}/audio/{urllib.request.quote(stem)}.mp3")[1]
+    assert _request(base_url + "/episodes", headers=AUTH)[1]["Cache-Control"] == "no-store"
+    login = _request(base_url + "/login")[1]
+    assert login["Cache-Control"] == "no-store"
+    assert "frame-ancestors 'none'" in login["Content-Security-Policy"]
+    assert "script-src 'nonce-" in login["Content-Security-Policy"]
+    # plain http behind the tunnel: reads are redirected, anything else is refused unprocessed
+    plain = {"X-Forwarded-Proto": "http"}
+    status, headers, _ = _request(base_url + "/feed", headers=plain)
+    assert (status, headers["Location"]) == (308, "https://pod.example/feed")
+    assert _form(base_url + "/login", {"username": "max", "password": PASSWORD}, plain)[0] == 400
+    assert _request(base_url + "/download", "POST", {"url": "https://youtu.be/abc"}, {**AUTH, **plain})[0] == 400
+
+
+# --- sign-in --------------------------------------------------------------------
+
+def test_account_setup_needs_the_token_and_a_real_password(base_url):
+    good = {"token": "secret-token", "username": "max", "password": PASSWORD, "password2": PASSWORD}
+    assert _form(base_url + "/setup", {**good, "token": "nope"})[0] == 403
+    assert _form(base_url + "/setup", {**good, "password": "short", "password2": "short"})[0] == 400
+    assert _form(base_url + "/setup", {**good, "password2": PASSWORD + "x"})[0] == 400
+    assert _form(base_url + "/setup", good, {"Origin": "https://evil.example"})[0] == 403
+    assert auth.load_account() is None
+    status, headers, _ = _form(base_url + "/setup", good)
+    assert (status, headers["Location"]) == (303, "/login?s")
+    stored = auth.load_account()
+    assert stored["username"] == "max" and PASSWORD not in json.dumps(stored)
+
+
+def test_sign_in_sets_a_locked_down_cookie_and_wrong_details_do_not(base_url):
+    auth.set_account("max", PASSWORD)
+    for fields in ({"username": "max", "password": "wrong password!"}, {"username": "mallory", "password": PASSWORD}):
+        status, headers, _ = _form(base_url + "/login", fields, {"CF-Connecting-IP": "198.51.100.7"})
+        assert (status, headers["Location"]) == (303, "/login?e")
+        assert "Set-Cookie" not in headers
+    assert _form(base_url + "/login", {"username": "max", "password": PASSWORD},
+                 {"Origin": "https://evil.example"})[0] == 403
+    assert b"Wrong user name, password or code." in _request(base_url + "/login?e")[2]
+    assert b"Wrong user name" not in _request(base_url + "/login")[2]
+    cookie, session, _ = _sign_in(base_url)
+    assert cookie.startswith("__Host-ytps=")
+    for flag in ("HttpOnly", "Secure", "SameSite=Strict", "Path=/"):
+        assert flag in cookie
+    assert _request(base_url + "/episodes", headers=session)[0] == 200
+    assert json.loads(_request(base_url + "/account", headers=session)[2]) == {"username": "max", "two_step": False}
+
+
+def test_a_session_cookie_alone_cannot_write(base_url):
+    _add_episode("vid00000001", "A1", "Channel A", 1000)
+    _, session, write = _sign_in(base_url)
+    target = base_url + "/episodes/vid00000001"
+    assert _request(target, "DELETE", headers=session)[0] == 403  # what a forged cross-site request looks like
+    assert _request(target, "DELETE", headers={**write, "Origin": "https://evil.example"})[0] == 403
+    assert _request(target, "DELETE", headers={**write, "X-CSRF-Token": "guess"})[0] == 403
+    assert _request(target, "DELETE", headers={**write, "Content-Type": "text/plain"})[0] == 403
+    assert len(server.list_episodes()) == 1
+    assert _request(target, "DELETE", headers=write)[0] == 200
+    # signing out ends the session on the server, not just in the browser
+    status, headers, _ = _request(base_url + "/logout", "POST", b"{}", write)
+    assert status == 200 and "Max-Age=0" in headers["Set-Cookie"]
+    assert _request(base_url + "/episodes", headers=session)[0] == 401
+
+
+def test_sessions_expire(base_url):
+    _, session, _ = _sign_in(base_url)
+    record = next(iter(auth._SESSIONS.values()))
+    record["seen"] -= auth.SESSION_IDLE_SECONDS + 1
+    assert _request(base_url + "/episodes", headers=session)[0] == 401
+    _, session, _ = _sign_in(base_url)
+    record = next(iter(auth._SESSIONS.values()))
+    record["created"] -= auth.SESSION_MAX_SECONDS + 1
+    assert _request(base_url + "/episodes", headers=session)[0] == 401
+
+
+def test_repeated_failures_lock_the_client_out(base_url):
+    auth.set_account("max", PASSWORD)
+    attacker, other = {"CF-Connecting-IP": "203.0.113.9"}, {"CF-Connecting-IP": "203.0.113.10"}
+    for _ in range(auth.MAX_FAILURES):
+        assert _form(base_url + "/login", {"username": "max", "password": "guess guess guess"}, attacker)[0] == 303
+    status, headers, _ = _form(base_url + "/login", {"username": "max", "password": PASSWORD}, attacker)
+    assert status == 429 and int(headers["Retry-After"]) > 0  # even the right password has to wait
+    assert _request(base_url + "/episodes", headers={**AUTH, **attacker})[0] == 429
+    assert _form(base_url + "/login", {"username": "max", "password": PASSWORD}, other)[1]["Location"] == "/"
+    # the API token is throttled the same way
+    scanner = {"CF-Connecting-IP": "203.0.113.11"}
+    for _ in range(auth.MAX_FAILURES):
+        assert _request(base_url + "/episodes", headers={"Authorization": "Bearer nope", **scanner})[0] == 401
+    assert _request(base_url + "/episodes", headers={**AUTH, **scanner})[0] == 429
+
+
+def test_two_step_codes(base_url):
+    # RFC 6238 test vector: SHA-1, time 59 -> 94287082, i.e. 6 digits 287082
+    secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+    assert auth._totp_code(secret, 59 // 30) == "287082"
+    assert auth.matching_totp_counter(secret, "287082", now=59) == 1
+    assert auth.matching_totp_counter(secret, "287 082", now=89) == 1  # one step of clock drift
+    assert auth.matching_totp_counter(secret, "287082", now=200) is None
+
+    _, _, write = _sign_in(base_url)
+    started = json.loads(_request(base_url + "/account/totp", "POST", {"action": "start"}, write)[2])
+    assert started["uri"].startswith("otpauth://totp/") and started["secret"] in started["uri"]
+    assert _request(base_url + "/account/totp", "POST", {"action": "confirm", "code": "000000"}, write)[0] == 400
+    assert auth.load_account()["totp"] is None
+    code = auth._totp_code(started["secret"], int(time.time() // 30))
+    assert _request(base_url + "/account/totp", "POST", {"action": "confirm", "code": code}, write)[0] == 200
+
+    assert not auth.check_login("max", PASSWORD)  # password alone is no longer enough
+    assert not auth.check_login("max", PASSWORD, "000000")
+    assert auth.check_login("max", PASSWORD, code)
+    assert not auth.check_login("max", PASSWORD, code)  # a code works once
+    assert _request(base_url + "/account/totp", "POST", {"action": "disable", "password": "nope"}, write)[0] == 403
+    assert _request(base_url + "/account/totp", "POST", {"action": "disable", "password": PASSWORD}, write)[0] == 200
+    assert auth.check_login("max", PASSWORD)
 
 
 def test_bad_requests_are_rejected_before_anything_is_queued(base_url):
@@ -210,7 +376,8 @@ def test_bad_requests_are_rejected_before_anything_is_queued(base_url):
     assert _request(f"{base_url}/download", "POST", b"not json", AUTH)[0] == 400
     big = b'{"url":"https://youtu.be/' + b"a" * (70 * 1024) + b'"}'
     assert _request(f"{base_url}/download", "POST", big, AUTH)[0] == 413
-    assert _request(f"{base_url}/subscriptions", "POST", {"url": "https://x.test/@c", "max_items": "many"}, AUTH)[0] == 400
+    assert _request(f"{base_url}/subscriptions", "POST", {"url": "https://www.youtube.com/@c", "max_items": "many"}, AUTH)[0] == 400
+    assert _request(f"{base_url}/download", "POST", {"url": "http://192.168.1.1/admin"}, AUTH)[0] == 400
     assert len(tasks.list_tasks()) == before
 
 

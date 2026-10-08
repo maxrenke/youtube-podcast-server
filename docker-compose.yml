@@ -4,8 +4,14 @@ services:
     image: youtube-podcast-server:latest
     container_name: youtube-podcast-server
     restart: unless-stopped
+    # Published on the docker bridge address only: the cloudflared container reaches it
+    # there, and nothing on the LAN can talk to the server over plain http.
     ports:
-      - "5757:8080"
+      - "172.17.0.1:5757:8080"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     volumes:
       - /DATA/AppData/youtube-podcast-server/downloads:/app/downloads
       - /DATA/AppData/youtube-podcast-server/state:/app/state
@@ -21,3 +27,4 @@ services:
       - SUB_MAX_ITEMS=${SUB_MAX_ITEMS:-10}
       - KEEP_DAYS=${KEEP_DAYS:-0}
       - KEEP_COUNT=${KEEP_COUNT:-0}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-youtube.com,youtu.be,youtube-nocookie.com}
