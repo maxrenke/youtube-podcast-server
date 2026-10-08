@@ -159,6 +159,7 @@ def test_range_head_and_path_checks(base_url):
     assert _request(f"{base_url}/audio/..%2Fstate%2Fx.mp3")[0] == 400
     assert _request(f"{base_url}/thumb/{urllib.request.quote(stem)}.info.json")[0] == 400
     assert _request(f"{base_url}/rss", method="HEAD")[0] == 200
+    assert b'href="https://pod.example/feed" rel="self"' in _request(f"{base_url}/feed")[2]
     assert _request(f"{base_url}/rss/channel-a")[0] == 200
     assert _request(f"{base_url}/rss/nobody")[0] == 404
     assert _request(f"{base_url}/chapters/vid00000001.json")[0] == 404  # no chapters on this one

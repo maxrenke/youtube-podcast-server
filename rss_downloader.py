@@ -221,14 +221,15 @@ def chapters_json(video_id: str):
     return None
 
 
-def generate_rss(feed: str = ""):
+def generate_rss(feed: str = "", path: str = "/rss"):
     """The whole library, or with ``feed`` (a channel slug) only that channel's episodes.
 
-    Returns None when ``feed`` matches no episode.
+    ``path`` is the URL path the main feed was requested at; it becomes the
+    feed's self link. Returns None when ``feed`` matches no episode.
     """
     eps = list_episodes()
     title, desc, author = FEED_TITLE, FEED_DESC, FEED_AUTHOR
-    link, self_url = PUBLIC_BASE_URL, f"{PUBLIC_BASE_URL}/rss"
+    link, self_url = PUBLIC_BASE_URL, f"{PUBLIC_BASE_URL}{path}"
     artwork = f"{PUBLIC_BASE_URL}/artwork.jpg"
     if feed:
         eps = [e for e in eps if e["feed"] == feed]
@@ -324,7 +325,7 @@ button.danger{background:#fee;border:1px solid #c66;color:#a00}
 h2{margin-top:1.5rem}
 </style>
 <h1><img src="/artwork.jpg" alt="" style="width:48px;height:48px;border-radius:8px;vertical-align:middle"> YouTube Podcast</h1>
-<p>Feed: <a id="feed" href="/rss">/rss</a> <span id="feeds" class="muted"></span></p>
+<p>Feed: <a id="feed" href="/feed">/feed</a> <span id="feeds" class="muted"></span></p>
 
 <h2>Download single video</h2>
 <form id="dlForm"><input id="dlUrl" placeholder="https://www.youtube.com/watch?v=..." required><button>Download</button></form>
@@ -525,8 +526,11 @@ class Handler(BaseHTTPRequestHandler):
                 "public_base_url": PUBLIC_BASE_URL,
                 "auth_required": bool(API_TOKEN),
             })
-        elif path == "/rss":
-            self._text(200, generate_rss(), "application/rss+xml; charset=utf-8")
+        elif path in ("/rss", "/feed"):
+            # Same feed under two addresses. Podcast apps key a podcast on its URL and
+            # some only read the cover when they first import it, so a second
+            # address is the way to get a clean re-import.
+            self._text(200, generate_rss(path=path), "application/rss+xml; charset=utf-8")
         elif path.startswith("/rss/"):
             xml = generate_rss(unquote(path[len("/rss/"):]))
             if xml is None:

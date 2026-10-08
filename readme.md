@@ -127,6 +127,13 @@ HTML page with forms for submitting URLs and managing subscriptions.
 filesystem on every request, so removing an mp3 makes it disappear from the
 feed (see [Removing episodes](#removing-episodes)).
 
+### `GET /feed` - the same feed at a second address
+
+Identical to `/rss` apart from its self link. Podcast apps identify a podcast
+by its URL, and Pocket Casts reads the cover only when it first imports a
+feed: if an app is stuck with stale artwork, follow the other address and
+unfollow the old one.
+
 ### `GET /rss/<channel-slug>` - one channel's feed
 
 Only the episodes from that channel, titled with the channel's name and
