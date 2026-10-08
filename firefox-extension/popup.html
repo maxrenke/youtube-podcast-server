@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>YouTube Podcast</title>
+<style>
+  body { font: 14px system-ui, sans-serif; width: 340px; margin: 0; padding: 12px; color: #1b1b1f; background: #fff; }
+  h1 { font-size: 15px; margin: 0 0 8px; display: flex; align-items: center; gap: 8px; }
+  h1 img { width: 24px; height: 24px; }
+  #page { font-size: 12px; color: #555; overflow-wrap: anywhere; margin-bottom: 10px; }
+  #page b { color: #1b1b1f; font-size: 13px; display: block; }
+  button { font: inherit; padding: 7px 10px; border-radius: 6px; border: 1px solid #c8c8cc; background: #f3f3f5; cursor: pointer; width: 100%; margin-bottom: 6px; }
+  button.primary { background: #e52d2d; border-color: #e52d2d; color: #fff; font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  #message { min-height: 18px; font-size: 12px; margin: 4px 0 8px; }
+  #message.error { color: #b00020; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: #777; margin: 10px 0 4px; }
+  #tasks { list-style: none; margin: 0; padding: 0; font-size: 12px; }
+  #tasks li { padding: 3px 0; border-top: 1px solid #eee; overflow-wrap: anywhere; }
+  .status { font-weight: 600; }
+  .status.done { color: #0a7d2b; } .status.error { color: #b00020; } .status.downloading, .status.queued { color: #b35900; }
+  footer { margin-top: 10px; font-size: 12px; display: flex; justify-content: space-between; }
+  a { color: #1a5fb4; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #2b2a33; color: #fbfbfe; }
+    #page { color: #b8b8c0; } #page b { color: #fbfbfe; }
+    button { background: #42414d; border-color: #5b5b66; color: #fbfbfe; }
+    button.primary { background: #e52d2d; border-color: #e52d2d; }
+    #tasks li { border-color: #42414d; } h2 { color: #a0a0aa; } a { color: #7ab8ff; }
+    #message.error { color: #ff8a8a; }
+  }
+</style>
+</head>
+<body>
+  <h1><img src="icons/icon-48.png" alt="">YouTube Podcast</h1>
+  <div id="page"></div>
+  <button id="add" class="primary">Add this video</button>
+  <button id="subscribe">Subscribe to this playlist or channel</button>
+  <div id="message" role="status"></div>
+  <h2>Recent on the server</h2>
+  <ul id="tasks"></ul>
+  <footer><a id="server" href="#">Open server page</a><a id="options" href="#">Options</a></footer>
+  <script src="common.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

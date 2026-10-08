@@ -37,6 +37,9 @@ re-polled on a schedule so new uploads get pulled automatically.
 - **Private admin page and API** - with `API_TOKEN` set, only the feeds,
   audio, covers and chapters are reachable without the token.
 - **A feed per channel** - `/rss/<channel-slug>` next to the all-in-one `/rss`.
+- **Firefox extension** - add the video or subscribe to the channel you are
+  looking at from the toolbar or the right-click menu. See
+  [firefox-extension/README.md](firefox-extension/README.md).
 - **Survives restarts** - queued and running downloads are saved and re-queued;
   a failed single download is retried once.
 - **Optional retention** - `KEEP_DAYS` / `KEEP_COUNT`.

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>YouTube Podcast options</title>
+<style>
+  body { font: 14px system-ui, sans-serif; padding: 12px; max-width: 520px; }
+  label { display: block; margin: 10px 0 4px; font-weight: 600; }
+  input { font: inherit; width: 100%; box-sizing: border-box; padding: 6px 8px; }
+  p.hint { font-size: 12px; color: #666; margin: 4px 0 0; }
+  button { font: inherit; padding: 6px 14px; margin: 14px 8px 0 0; }
+  #result { margin-top: 12px; min-height: 18px; }
+  #result.error { color: #b00020; } #result.ok { color: #0a7d2b; }
+  @media (prefers-color-scheme: dark) { p.hint { color: #a0a0aa; } #result.error { color: #ff8a8a; } #result.ok { color: #6fdc8c; } }
+</style>
+</head>
+<body>
+  <label for="server">Server address</label>
+  <input id="server" type="url" placeholder="https://podcast.example.com" spellcheck="false">
+  <p class="hint">Where youtube-podcast-server is reachable from this browser.</p>
+
+  <label for="token">API token</label>
+  <input id="token" type="password" autocomplete="off" spellcheck="false">
+  <p class="hint">The server's API_TOKEN. Stored in this browser profile only and sent to that server with add, subscribe and delete requests.</p>
+
+  <button id="save">Save</button><button id="test">Test connection</button>
+  <div id="result" role="status"></div>
+  <script src="common.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>
