@@ -32,8 +32,15 @@ re-polled on a schedule so new uploads get pulled automatically.
   or forget your subs.
 - **RSS feed** with iTunes namespace tags so it imports cleanly into
   PocketCasts, Overcast, Apple Podcasts, AntennaPod, etc.
-- **Tiny built-in UI** at `/` for submitting URLs, browsing episodes,
-  managing subscriptions, and watching task status.
+- **Tiny built-in UI** at `/` for submitting URLs, browsing and deleting
+  episodes, managing subscriptions, and watching task status.
+- **Token-protected writes** - with `API_TOKEN` set, every POST and DELETE
+  needs `Authorization: Bearer <token>`; the feed, audio and covers stay open
+  for podcast apps.
+- **A feed per channel** - `/rss/<channel-slug>` next to the all-in-one `/rss`.
+- **Survives restarts** - queued and running downloads are saved and re-queued;
+  a failed single download is retried once.
+- **Optional retention** - `KEEP_DAYS` / `KEEP_COUNT`.
 - **No external dependencies inside Python** - stdlib only; yt-dlp and
   ffmpeg are system binaries.
 
@@ -66,6 +73,12 @@ All via env vars. Defaults shown.
 | `FEED_EMAIL`              | unset                            | `<itunes:owner>` email. Left out of the feed when unset.                             |
 | `FEED_CATEGORY`           | `Technology`                     | `<itunes:category>`. Must be one of Apple's category names.                          |
 | `FEED_PRIVATE`            | `1`                              | Emits `<itunes:block>Yes</itunes:block>` so directories do not list the feed. `0` to drop it. |
+| `API_TOKEN`               | unset                            | Secret for POST and DELETE requests. Unset = no authentication (a warning is logged). |
+| `AUDIO_QUALITY`           | `5`                              | LAME VBR quality, 0 (largest) to 9. 5 is about 130 kbps.                             |
+| `SUB_MAX_ITEMS`           | `10`                             | Entries from the top of a channel looked at per poll. 0 = all. Playlists default to all. |
+| `KEEP_DAYS`               | `0`                              | Delete episodes added more than this many days ago. 0 = off.                         |
+| `KEEP_COUNT`              | `0`                              | Keep only this many newest episodes. 0 = off.                                        |
+| `RETRY_DELAY_SECONDS`     | `60`                             | Wait before the one retry of a failed single download.                               |
 | `TZ`                      | unset                            | Timezone for the container's logs.                                                   |
 
 **`PUBLIC_BASE_URL` matters.** If your phone is on a different network than
@@ -74,6 +87,15 @@ the public HTTPS URL you expose (Cloudflare Tunnel, Tailscale Funnel, ngrok,
 nginx + Let's Encrypt - whatever).
 
 ## HTTP API
+
+**Authentication.** When `API_TOKEN` is set, every `POST` and `DELETE` must
+send `Authorization: Bearer <token>`; without it the answer is
+`401 {"error": "missing or wrong API token"}`. All `GET`/`HEAD` routes are
+open. The web UI asks for the token on the first write and keeps it in the
+browser's `localStorage`. The curl examples below omit the header for brevity:
+add `-H "Authorization: Bearer $API_TOKEN"`.
+
+Request bodies are limited to 64 KB (`413` beyond that).
 
 ### `GET /` - UI
 
@@ -104,6 +126,29 @@ HTML page with forms for submitting URLs and managing subscriptions.
 `DOWNLOAD_DIR`, newest addition first. The list is derived from the
 filesystem on every request, so removing an mp3 makes it disappear from the
 feed (see [Removing episodes](#removing-episodes)).
+
+### `GET /rss/<channel-slug>` - one channel's feed
+
+Only the episodes from that channel, titled with the channel's name and
+wearing its newest episode's cover. The slug is the channel name in lower
+case with non-alphanumerics turned into `-` (`Professor Dave Explains` ->
+`professor-dave-explains`). `404` if no episode matches.
+
+### `GET /feeds` - available channel feeds
+
+```json
+[{"slug": "professor-dave-explains", "title": "Professor Dave Explains",
+  "url": "https://example.com/rss/professor-dave-explains", "episodes": 5}]
+```
+
+### `GET /chapters/<video_id>.json` - chapters
+
+Podcasting 2.0 chapters document, referenced from the item's
+`<podcast:chapters>` tag. `404` for episodes without chapters.
+
+### `DELETE /episodes/<video_id>` - delete an episode
+
+Removes the mp3, cover and info.json. `404` if there is no such episode.
 
 ### `GET /episodes` - JSON list
 
@@ -147,8 +192,15 @@ Supports any URL that yt-dlp accepts as a multi-video source:
 - Channel URL: `https://www.youtube.com/channel/CHANNEL_ID`
 - "Uploads" tab: `https://www.youtube.com/@CHANNEL_HANDLE/videos`
 
-Optional body field `"interval_seconds": <int>` overrides the global poll
-interval for this one subscription.
+Optional body fields:
+
+- `"interval_seconds": <int>` overrides the global poll interval.
+- `"max_items": <int>` is how many entries from the top of the list each poll
+  looks at (`--playlist-end`); `0` means all. Default: `SUB_MAX_ITEMS` for
+  channels (they list newest first, so this keeps a new subscription from
+  pulling the whole back catalogue) and `0` for playlist URLs (`list=`).
+  Do not bound a playlist that grows at the end: new entries past the limit
+  would never be seen.
 
 Response (HTTP 201):
 
@@ -184,8 +236,12 @@ the same videos - delete `STATE_DIR/archive.txt` if you want a clean slate).
 
 ### `GET /tasks` and `GET /tasks/<id>` - task history
 
-Every download (single-video or subscription poll) creates a task. Tasks are
-kept in memory only - they're for live status, not long-term audit.
+Every download (single-video or subscription poll) creates a task. Tasks that
+are queued or running are saved to `STATE_DIR/tasks.json` and re-queued when
+the server starts; finished ones are kept in memory only (last 200). A failed
+single download is retried once after `RETRY_DELAY_SECONDS`; a failed poll
+runs again at the subscription's next interval. Single downloads and polls
+have separate workers, so a long poll does not hold up a single video.
 
 ### `GET /audio/<filename>` - download an mp3
 
@@ -233,8 +289,11 @@ What each RSS `<item>` carries:
 | `<itunes:duration>`     | Seconds.                                                                 |
 | `<guid>`                | Video id.                                                                |
 
-Chapters live inside the mp3 (ID3 `CHAP` frames), so players that read file
-chapters show them once the episode is downloaded or streaming.
+Chapters are provided twice: inside the mp3 (ID3 `CHAP` frames) and as a
+`<podcast:chapters>` JSON document, so both kinds of player show them.
+
+When an episode is published, its info.json is cut down to the fields the
+feed uses (a few KB instead of several hundred).
 
 Feed-level tags: `<image>`, `<itunes:image>`, `<itunes:summary>`,
 `<itunes:owner>`, `<itunes:type>`, `<itunes:category>`, `<itunes:block>`,
@@ -246,8 +305,9 @@ it, and already-downloaded episodes keep the file they have.
 
 ## Removing episodes
 
-There is no delete endpoint. Remove (or move out of the top level of
-`DOWNLOAD_DIR`) the three files for an episode:
+Use the Delete button in the UI, `DELETE /episodes/<video_id>`, or set
+`KEEP_DAYS` / `KEEP_COUNT` for automatic clean-up. By hand, remove (or move
+out of the top level of `DOWNLOAD_DIR`) the three files for an episode:
 
 ```bash
 cd /DATA/AppData/youtube-podcast-server/downloads
@@ -287,7 +347,8 @@ duplicate downloads.
 |-------------------------------|-------------------------------------------------------------------|
 | `DOWNLOAD_DIR/*.mp3`          | The audio files served at `/audio/<filename>`.                    |
 | `DOWNLOAD_DIR/*.jpg`          | Square episode cover served at `/thumb/<filename>`.               |
-| `DOWNLOAD_DIR/.incoming/`     | Staging folder yt-dlp works in. Finished episodes are moved up one level (mp3 last), so the feed never lists a half-written file. Leftovers here are from failed or interrupted downloads and are reused on retry. |
+| `DOWNLOAD_DIR/.incoming/<id>/`| Staging folder per task (`sub-<id>` for a subscription). Finished episodes are moved up into `DOWNLOAD_DIR` (mp3 last), so the feed never lists a half-written file. Leftovers are from interrupted downloads and are reused on retry. |
+| `STATE_DIR/tasks.json`        | Queued and running tasks, re-queued on start.                     |
 | `DOWNLOAD_DIR/*.info.json`    | yt-dlp metadata sidecar; powers RSS titles, show notes, durations.|
 | `STATE_DIR/subscriptions.json`| All registered subscriptions and their schedules.                 |
 | `STATE_DIR/archive.txt`       | yt-dlp dedup log (`youtube VIDEO_ID` per line).                   |
@@ -298,8 +359,8 @@ In the provided `docker-compose.yml` both directories are bind-mounted to
 ## Local development (no Docker)
 
 Prereqs: Python 3.11+, `yt-dlp` on PATH, `ffmpeg` on PATH. Lint and type
-checks run as pre-commit hooks (`ruff check`, `mypy`); both must pass to
-commit.
+checks and the tests run as pre-commit hooks (`ruff check`, `mypy`,
+`python -m pytest -q tests`); all must pass to commit.
 
 ```bash
 python rss_downloader.py
@@ -321,9 +382,12 @@ PORT=9000 POLL_INTERVAL_SECONDS=900 \
 ```
 
 The box (`ssh casaos`, repo at `~/youtube-podcast-server`) runs
-`git pull --ff-only && docker compose up -d --build`. A rebuild also fetches
-the latest yt-dlp release, which is the usual fix when YouTube downloads
-start failing.
+`git pull --ff-only && docker compose up -d --build`. The container also runs
+`yt-dlp -U` every time it starts, so `docker restart youtube-podcast-server`
+is the usual fix when YouTube downloads start failing.
+
+The API token lives in `~/youtube-podcast-server/.env` on the box
+(`API_TOKEN=...`, git-ignored); compose passes it into the container.
 
 The live instance is published at `https://podcast.maxrenke.com` through a
 Cloudflare Tunnel (`casaos`) to `http://172.17.0.1:5757`.
@@ -363,11 +427,12 @@ Cloudflare Tunnel (`casaos`) to `http://172.17.0.1:5757`.
 
 ## Security
 
-There is no authentication. Anyone who can reach the server can queue
-downloads and add or remove subscriptions. Request URLs are restricted to
-`http(s)://` and passed to yt-dlp after `--`, so a request cannot inject
-yt-dlp options, but it can still make the box download arbitrary media and
-fill the disk. If you're exposing this publicly:
+Set `API_TOKEN`. Without it anyone who can reach the server can queue
+downloads, delete episodes and change subscriptions. With it, only the read
+routes are public: the feed, audio, covers, and the JSON status endpoints
+(`/episodes`, `/tasks`, `/subscriptions` - these reveal what you have queued).
+Request URLs are restricted to `http(s)://` and passed to yt-dlp after `--`,
+so a request cannot inject yt-dlp options. For more than a shared secret:
 
 - Put it behind Cloudflare Access (Zero Trust), an OAuth proxy
   (oauth2-proxy), or basic auth via your reverse proxy.

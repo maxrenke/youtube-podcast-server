@@ -1,3 +1,4 @@
+import hmac
 import html
 import json
 import os
@@ -12,6 +13,7 @@ import tasks
 from tasks import (
     DOWNLOAD_DIR,
     add_subscription,
+    delete_episode,
     enqueue_download,
     get_subscription,
     get_task,
@@ -35,6 +37,10 @@ FEED_CATEGORY = os.environ.get("FEED_CATEGORY", "Technology")
 # episodes are other people's videos, so this feed is for personal use only.
 FEED_PRIVATE = os.environ.get("FEED_PRIVATE", "1").lower() not in ("0", "false", "no")
 ARTWORK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artwork.jpg")
+# When set, every POST and DELETE needs "Authorization: Bearer <API_TOKEN>".
+# GET routes stay open: podcast apps fetch the feed, audio and covers with no login.
+API_TOKEN = os.environ.get("API_TOKEN", "")
+MAX_BODY_BYTES = 64 * 1024
 PORT = int(os.environ.get("PORT", "8080"))
 START_TIME = time.time()
 
@@ -70,7 +76,28 @@ def _fmt_upload_date(yyyymmdd: str) -> str:
     return ""
 
 
+def _slug(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+_EPISODE_CACHE: dict = {"key": None, "items": []}
+
+
 def list_episodes():
+    """Episodes, newest addition first. Cached until DOWNLOAD_DIR changes."""
+    try:
+        mtime = os.stat(DOWNLOAD_DIR).st_mtime
+    except OSError:
+        return []
+    # A folder touched in the last couple of seconds may still be changing.
+    if _EPISODE_CACHE["key"] == mtime and time.time() - mtime > 2:
+        return _EPISODE_CACHE["items"]
+    items = _scan_episodes()
+    _EPISODE_CACHE.update(key=mtime, items=items)
+    return items
+
+
+def _scan_episodes():
     if not os.path.isdir(DOWNLOAD_DIR):
         return []
     items = []
@@ -101,6 +128,7 @@ def list_episodes():
             "video_id": info.get("id") or fn,
             "thumbnail": thumbnail,
             "uploader": info.get("channel") or info.get("uploader") or "",
+            "feed": _slug(info.get("channel") or info.get("uploader") or ""),
             "channel_url": info.get("channel_url") or info.get("uploader_url") or "",
             "webpage_url": info.get("webpage_url") or "",
             "upload_date": _fmt_upload_date(str(info.get("upload_date") or "")),
@@ -166,33 +194,77 @@ def _attr(value: str) -> str:
     return sx.escape(value, {chr(34): "&quot;"})
 
 
-def generate_rss():
+def list_feeds():
+    """One entry per channel that has episodes: ``/rss/<slug>`` serves only that channel."""
+    feeds: dict[str, dict] = {}
+    for ep in list_episodes():
+        if not ep["feed"]:
+            continue
+        feed = feeds.setdefault(ep["feed"], {
+            "slug": ep["feed"],
+            "title": ep["uploader"],
+            "url": f"{PUBLIC_BASE_URL}/rss/{ep['feed']}",
+            "episodes": 0,
+        })
+        feed["episodes"] += 1
+    return sorted(feeds.values(), key=lambda f: f["title"].lower())
+
+
+def chapters_json(video_id: str):
+    """Podcasting 2.0 chapters document for one episode, or None."""
+    for ep in list_episodes():
+        if ep["video_id"] == video_id and ep["chapters"]:
+            return {
+                "version": "1.2.0",
+                "chapters": [{"startTime": c["start"], "title": c["title"]} for c in ep["chapters"]],
+            }
+    return None
+
+
+def generate_rss(feed: str = ""):
+    """The whole library, or with ``feed`` (a channel slug) only that channel's episodes.
+
+    Returns None when ``feed`` matches no episode.
+    """
     eps = list_episodes()
-    now = formatdate(time.time(), usegmt=True)
+    title, desc, author = FEED_TITLE, FEED_DESC, FEED_AUTHOR
+    link, self_url = PUBLIC_BASE_URL, f"{PUBLIC_BASE_URL}/rss"
     artwork = f"{PUBLIC_BASE_URL}/artwork.jpg"
+    if feed:
+        eps = [e for e in eps if e["feed"] == feed]
+        if not eps:
+            return None
+        title = author = eps[0]["uploader"]
+        desc = f"{title} videos as audio, from {FEED_TITLE}."
+        link = eps[0]["channel_url"] or PUBLIC_BASE_URL
+        self_url = f"{PUBLIC_BASE_URL}/rss/{feed}"
+        # A channel feed wears its newest episode's cover.
+        artwork = eps[0]["thumbnail"] or artwork
+    now = formatdate(time.time(), usegmt=True)
     out = []
     out.append('<?xml version="1.0" encoding="UTF-8"?>')
     out.append(
         '<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"'
         ' xmlns:content="http://purl.org/rss/1.0/modules/content/"'
-        ' xmlns:atom="http://www.w3.org/2005/Atom">'
+        ' xmlns:atom="http://www.w3.org/2005/Atom"'
+        ' xmlns:podcast="https://podcastindex.org/namespace/1.0">'
     )
     out.append("<channel>")
-    out.append(f"  <title>{sx.escape(FEED_TITLE)}</title>")
-    out.append(f"  <link>{sx.escape(PUBLIC_BASE_URL)}</link>")
-    out.append(f'  <atom:link href="{_attr(PUBLIC_BASE_URL)}/rss" rel="self" type="application/rss+xml"/>')
-    out.append(f"  <description>{sx.escape(FEED_DESC)}</description>")
+    out.append(f"  <title>{sx.escape(title)}</title>")
+    out.append(f"  <link>{sx.escape(link)}</link>")
+    out.append(f'  <atom:link href="{_attr(self_url)}" rel="self" type="application/rss+xml"/>')
+    out.append(f"  <description>{sx.escape(desc)}</description>")
     out.append("  <language>en-us</language>")
     out.append(f"  <lastBuildDate>{now}</lastBuildDate>")
     out.append("  <generator>youtube-podcast-server</generator>")
     out.append("  <image>")
     out.append(f"    <url>{sx.escape(artwork)}</url>")
-    out.append(f"    <title>{sx.escape(FEED_TITLE)}</title>")
-    out.append(f"    <link>{sx.escape(PUBLIC_BASE_URL)}</link>")
+    out.append(f"    <title>{sx.escape(title)}</title>")
+    out.append(f"    <link>{sx.escape(link)}</link>")
     out.append("  </image>")
     out.append(f'  <itunes:image href="{_attr(artwork)}"/>')
-    out.append(f"  <itunes:author>{sx.escape(FEED_AUTHOR)}</itunes:author>")
-    out.append(f"  <itunes:summary>{sx.escape(FEED_DESC)}</itunes:summary>")
+    out.append(f"  <itunes:author>{sx.escape(author)}</itunes:author>")
+    out.append(f"  <itunes:summary>{sx.escape(desc)}</itunes:summary>")
     out.append("  <itunes:owner>")
     out.append(f"    <itunes:name>{sx.escape(FEED_AUTHOR)}</itunes:name>")
     if FEED_EMAIL:
@@ -223,6 +295,11 @@ def generate_rss():
             out.append(f"    <itunes:image href=\"{_attr(ep['thumbnail'])}\"/>")
         if ep["uploader"]:
             out.append(f"    <itunes:author>{sx.escape(ep['uploader'])}</itunes:author>")
+        if ep["chapters"]:
+            chapters_url = f"{PUBLIC_BASE_URL}/chapters/{quote(ep['video_id'])}.json"
+            out.append(
+                f'    <podcast:chapters url="{_attr(chapters_url)}" type="application/json+chapters"/>'
+            )
         out.append("    <itunes:episodeType>full</itunes:episodeType>")
         out.append("    <itunes:explicit>false</itunes:explicit>")
         out.append("  </item>")
@@ -247,14 +324,14 @@ button.danger{background:#fee;border:1px solid #c66;color:#a00}
 h2{margin-top:1.5rem}
 </style>
 <h1><img src="/artwork.jpg" alt="" style="width:48px;height:48px;border-radius:8px;vertical-align:middle"> YouTube Podcast</h1>
-<p>Feed: <a id="feed" href="/rss">/rss</a></p>
+<p>Feed: <a id="feed" href="/rss">/rss</a> <span id="feeds" class="muted"></span></p>
 
 <h2>Download single video</h2>
 <form id="dlForm"><input id="dlUrl" placeholder="https://www.youtube.com/watch?v=..." required><button>Download</button></form>
 <p id="dlMsg" class="muted"></p>
 
 <h2>Subscribe to playlist or channel</h2>
-<p class="muted">Polled hourly. First pull starts immediately. yt-dlp <code>--download-archive</code> means already-downloaded videos are skipped.</p>
+<p class="muted">Polled hourly. First pull starts immediately; videos already pulled are skipped. A channel is limited to its newest 10 uploads per poll, a playlist is taken whole.</p>
 <form id="subForm"><input id="subUrl" placeholder="https://www.youtube.com/playlist?list=... or https://www.youtube.com/@channel" required><button>Subscribe</button></form>
 <p id="subMsg" class="muted"></p>
 <div id="subs"></div>
@@ -273,14 +350,30 @@ function fmtNext(ep){
   const m = Math.round(ms/60000);
   return m < 60 ? m+'m' : Math.round(m/60)+'h';
 }
+function token(){ try { return localStorage.getItem('token') || ''; } catch(e) { return ''; } }
+// Write requests carry the API token; on 401 ask for it once and retry.
+async function api(method, path, body){
+  const headers = {'Content-Type':'application/json'};
+  if(token()) headers['Authorization'] = 'Bearer ' + token();
+  const r = await fetch(path, {method, headers, body: body ? JSON.stringify(body) : undefined});
+  if(r.status !== 401) return r;
+  const t = prompt('API token (API_TOKEN on the server)');
+  if(!t) return r;
+  try { localStorage.setItem('token', t.trim()); } catch(e) {}
+  return api(method, path, body);
+}
 async function refresh(){
+  const feeds = await (await fetch('/feeds')).json();
+  document.getElementById('feeds').innerHTML = feeds.length ? ' - per channel: ' + feeds.map(f =>
+    `<a href="${esc(f.url)}">${esc(f.title)}</a> (${f.episodes})`).join(', ') : '';
   const eps = await (await fetch('/episodes')).json();
   document.getElementById('eps').innerHTML = eps.map(e =>
     `<div class="ep">${e.thumbnail ? `<img src="${esc(e.thumbnail)}" alt="" loading="lazy">` : ''}
      <div style="flex:1;min-width:0"><b>${esc(e.title)}</b><br>
      <span class="muted">${esc(e.uploader)}${e.upload_date ? ' - uploaded '+esc(e.upload_date) : ''} - ${fmtDur(e.duration)} - ${(e.size/1048576).toFixed(1)} MB - added ${new Date(e.added*1000).toLocaleString()}${e.chapters.length ? ' - '+e.chapters.length+' chapters' : ''}${e.webpage_url ? ` - <a href="${esc(e.webpage_url)}" target="_blank" rel="noopener">source</a>` : ''}</span>
      ${e.description ? `<details><summary class="muted">Description</summary><pre>${esc(e.description)}</pre></details>` : ''}
-     <audio controls preload="none" src="/audio/${encodeURIComponent(e.filename)}"></audio></div></div>`).join('') || '<p class="muted">no episodes yet</p>';
+     <audio controls preload="none" src="/audio/${encodeURIComponent(e.filename)}"></audio></div>
+     <div><button class="danger" data-del-episode="${esc(e.video_id)}" data-title="${esc(e.title)}">Delete</button></div></div>`).join('') || '<p class="muted">no episodes yet</p>';
 
   const subs = await (await fetch('/subscriptions')).json();
   document.getElementById('subs').innerHTML = subs.map(s => {
@@ -288,9 +381,9 @@ async function refresh(){
     return `<div class="sub row">
       <div style="flex:1">
         <div><a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.url)}</a></div>
-        <div class="muted">added ${fmtTs(s.added)} - last poll ${fmtTs(s.last_poll)} (${esc(last)}) - next in ${fmtNext(s.next_poll)}</div>
+        <div class="muted">${s.max_items ? 'newest '+s.max_items+' per poll' : 'all items'} - added ${fmtTs(s.added)} - last poll ${fmtTs(s.last_poll)} (${esc(last)}) - next in ${fmtNext(s.next_poll)}</div>
       </div>
-      <button class="danger" onclick="del('${s.id}')">Unsubscribe</button>
+      <button class="danger" data-del-sub="${esc(s.id)}">Unsubscribe</button>
     </div>`;
   }).join('') || '<p class="muted">no subscriptions</p>';
 
@@ -298,15 +391,22 @@ async function refresh(){
   document.getElementById('tasks').innerHTML = ts.slice(-25).reverse().map(t =>
     `<div class="muted">[${esc(t.status)}] (${esc(t.type)}) ${esc(t.url)} ${t.error?'- '+esc(t.error):''} ${t.downloaded&&t.downloaded.length?'- pulled '+t.downloaded.length:''}</div>`).join('') || '<p class="muted">no tasks</p>';
 }
-async function del(id){
-  if(!confirm('Unsubscribe?')) return;
-  await fetch('/subscriptions/'+id, {method:'DELETE'});
+// Ids travel in data attributes, never inside inline handlers.
+document.addEventListener('click', async e => {
+  const d = e.target.dataset || {};
+  if(d.delSub){
+    if(!confirm('Unsubscribe?')) return;
+    await api('DELETE', '/subscriptions/' + encodeURIComponent(d.delSub));
+  } else if(d.delEpisode){
+    if(!confirm('Delete "' + d.title + '" from the server?')) return;
+    await api('DELETE', '/episodes/' + encodeURIComponent(d.delEpisode));
+  } else return;
   refresh();
-}
+});
 document.getElementById('dlForm').onsubmit = async e => {
   e.preventDefault();
   const u = document.getElementById('dlUrl').value;
-  const r = await fetch('/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:u})});
+  const r = await api('POST', '/download', {url:u});
   document.getElementById('dlMsg').textContent = r.ok ? 'queued' : 'error: ' + ((await r.json()).error || r.status);
   document.getElementById('dlUrl').value='';
   refresh();
@@ -314,7 +414,7 @@ document.getElementById('dlForm').onsubmit = async e => {
 document.getElementById('subForm').onsubmit = async e => {
   e.preventDefault();
   const u = document.getElementById('subUrl').value;
-  const r = await fetch('/subscriptions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:u})});
+  const r = await api('POST', '/subscriptions', {url:u});
   document.getElementById('subMsg').textContent = r.ok ? 'subscribed; first poll starting' : 'error: ' + ((await r.json()).error || r.status);
   document.getElementById('subUrl').value='';
   refresh();
@@ -418,14 +518,29 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/health":
             self._json(200, {
                 "status": "ok",
-                "queue_length": tasks.TASK_QUEUE.qsize(),
+                "queue_length": tasks.queue_length(),
                 "tasks_total": len(list_tasks()),
                 "uptime_seconds": int(time.time() - START_TIME),
                 "downloads": len(list_episodes()),
                 "public_base_url": PUBLIC_BASE_URL,
+                "auth_required": bool(API_TOKEN),
             })
         elif path == "/rss":
             self._text(200, generate_rss(), "application/rss+xml; charset=utf-8")
+        elif path.startswith("/rss/"):
+            xml = generate_rss(unquote(path[len("/rss/"):]))
+            if xml is None:
+                self._text(404, "no such feed")
+            else:
+                self._text(200, xml, "application/rss+xml; charset=utf-8")
+        elif path == "/feeds":
+            self._json(200, list_feeds())
+        elif path.startswith("/chapters/") and path.endswith(".json"):
+            doc = chapters_json(unquote(path[len("/chapters/"):-len(".json")]))
+            if doc is None:
+                self._json(404, {"error": "not found"})
+            else:
+                self._json(200, doc)
         elif path == "/episodes":
             self._json(200, list_episodes())
         elif path == "/tasks":
@@ -453,16 +568,43 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._text(404, "not found")
 
+    def _authorized(self) -> bool:
+        """True if no token is configured or the request carries it; otherwise answers 401."""
+        if not API_TOKEN:
+            return True
+        given = self.headers.get("Authorization", "").encode()
+        if hmac.compare_digest(given, f"Bearer {API_TOKEN}".encode()):
+            return True
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", "Bearer")
+        body = json.dumps({"error": "missing or wrong API token"}).encode()
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return False
+
     def _read_json(self) -> dict | None:
-        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if length < 0 or length > MAX_BODY_BYTES:
+            self._json(413, {"error": "request body too large"})
+            return None
         raw = self.rfile.read(length) if length else b"{}"
         try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            data = None
+        if not isinstance(data, dict):
             self._json(400, {"error": "invalid json"})
             return None
+        return data
 
     def do_POST(self):
+        if not self._authorized():
+            return
         if self.path == "/download":
             data = self._read_json()
             if data is None:
@@ -481,14 +623,29 @@ class Handler(BaseHTTPRequestHandler):
             if not is_valid_url(url):
                 self._json(400, {"error": "url must start with http:// or https://"})
                 return
-            interval = data.get("interval_seconds")
-            sub = add_subscription(url, interval_seconds=interval)
+            try:
+                sub = add_subscription(
+                    url,
+                    interval_seconds=data.get("interval_seconds"),
+                    max_items=data.get("max_items"),
+                )
+            except (TypeError, ValueError):
+                self._json(400, {"error": "interval_seconds and max_items must be numbers"})
+                return
             self._json(201, sub)
         else:
             self._text(404, "not found")
 
     def do_DELETE(self):
-        if self.path.startswith("/subscriptions/"):
+        if not self._authorized():
+            return
+        if self.path.startswith("/episodes/"):
+            video_id = unquote(self.path[len("/episodes/"):])
+            if delete_episode(video_id):
+                self._json(200, {"deleted": video_id})
+            else:
+                self._json(404, {"error": "not found"})
+        elif self.path.startswith("/subscriptions/"):
             sub_id = self.path[len("/subscriptions/"):]
             if remove_subscription(sub_id):
                 self._json(200, {"deleted": sub_id})
@@ -501,6 +658,8 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     print(f"Serving on 0.0.0.0:{PORT} (public base: {PUBLIC_BASE_URL}, downloads: {DOWNLOAD_DIR})", flush=True)
+    if not API_TOKEN:
+        print("WARNING: API_TOKEN is not set - anyone who can reach this server can add and delete", flush=True)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     try:
         server.serve_forever()

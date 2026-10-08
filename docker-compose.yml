@@ -10,8 +10,14 @@ services:
       - /DATA/AppData/youtube-podcast-server/downloads:/app/downloads
       - /DATA/AppData/youtube-podcast-server/state:/app/state
     environment:
-      - TZ=America/New_York
+      - TZ=America/Los_Angeles
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-https://podcast.maxrenke.com}
       - FEED_TITLE=YouTube Podcast
       - FEED_AUTHOR=Max Renke
       - POLL_INTERVAL_SECONDS=${POLL_INTERVAL_SECONDS:-3600}
+      # Secret for POST/DELETE requests. Put API_TOKEN=... in a .env file next to this one.
+      - API_TOKEN=${API_TOKEN:-}
+      - AUDIO_QUALITY=${AUDIO_QUALITY:-5}
+      - SUB_MAX_ITEMS=${SUB_MAX_ITEMS:-10}
+      - KEEP_DAYS=${KEEP_DAYS:-0}
+      - KEEP_COUNT=${KEEP_COUNT:-0}

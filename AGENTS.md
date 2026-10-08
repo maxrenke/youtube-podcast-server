@@ -186,7 +186,7 @@ Documented in `readme.md` (HTTP API, env vars, episode metadata). Keep that file
 
 ## Notes for Agents
 
-1. **No existing tests**: add pytest tests for new logic where practical.
+1. **Tests**: `python -m pytest -q tests` (no network needed). Add tests for new logic.
 2. **yt-dlp binary**: in Docker the standalone yt-dlp binary is used, fetched at build time.
-3. **Pre-commit**: `ruff check` and `mypy` must pass; do not bypass the hook.
+3. **Pre-commit**: `ruff check`, `mypy` and `pytest` must pass; do not bypass the hook.
 4. **Security**: no authentication. The live instance is public through a Cloudflare Tunnel, so treat every request field as hostile (URLs are validated in `tasks.is_valid_url` and passed to yt-dlp after `--`).

@@ -1,24 +1,27 @@
-"""Task queue, worker, and subscription scheduler.
+"""Task queues, workers, subscriptions and retention.
 
-Two task types share one queue:
+Two task types, each with its own queue and worker so a long subscription poll
+never blocks a single-video request:
 
 - ``video``        - one-shot single-video download (``--no-playlist``).
 - ``subscription`` - poll a playlist or channel URL with ``--download-archive``
                      so only new uploads get pulled.
 
-Subscriptions live on disk in ``STATE_DIR/subscriptions.json`` and yt-dlp's
-deduplication archive lives in ``STATE_DIR/archive.txt``. Both survive
-container restarts as long as ``STATE_DIR`` is on a mounted volume.
+State on disk (``STATE_DIR``, keep it on a mounted volume):
 
-A daemon thread (``_scheduler``) wakes every ``POLL_INTERVAL_SECONDS`` and
-enqueues a poll task for every subscription whose ``next_poll`` has passed.
-On ``add_subscription`` the new subscription's ``next_poll`` is set to
-*now*, so the first poll runs immediately.
+- ``subscriptions.json`` - registered subscriptions and their schedules.
+- ``archive.txt``        - yt-dlp's dedup log for subscriptions.
+- ``tasks.json``         - tasks that are queued or running; re-queued on start.
+
+A daemon thread (``_scheduler``) wakes every ``SCHEDULER_TICK_SECONDS``,
+enqueues a poll for every subscription whose ``next_poll`` has passed, and
+applies the retention limits (``KEEP_DAYS`` / ``KEEP_COUNT``).
 """
 
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -31,19 +34,32 @@ DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
 STATE_DIR = os.environ.get("STATE_DIR", "state")
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", str(60 * 60)))
 SCHEDULER_TICK_SECONDS = int(os.environ.get("SCHEDULER_TICK_SECONDS", "60"))
+# LAME VBR quality, 0 (largest) to 9. 5 is about 130 kbps, plenty for speech.
+AUDIO_QUALITY = os.environ.get("AUDIO_QUALITY", "5")
+# How many entries from the top of a channel are looked at on each poll (0 = all).
+SUB_MAX_ITEMS = int(os.environ.get("SUB_MAX_ITEMS", "10"))
+# Retention, both off by default: drop episodes older than KEEP_DAYS, and keep
+# only the newest KEEP_COUNT.
+KEEP_DAYS = int(os.environ.get("KEEP_DAYS", "0"))
+KEEP_COUNT = int(os.environ.get("KEEP_COUNT", "0"))
+RETRY_DELAY_SECONDS = int(os.environ.get("RETRY_DELAY_SECONDS", "60"))
+MAX_ATTEMPTS = 2
+TASK_HISTORY = 200
 
 # ID3 album tag written into every mp3; rss_downloader uses the same value as the feed title.
 FEED_TITLE = os.environ.get("FEED_TITLE", "YouTube Podcast")
 
-# yt-dlp works in INCOMING_DIR; finished episodes are moved up into DOWNLOAD_DIR.
-# The feed lists every mp3 in DOWNLOAD_DIR, so a file must never be there half-written.
+# yt-dlp works in a per-task folder under INCOMING_DIR; finished episodes are moved
+# up into DOWNLOAD_DIR. The feed lists every mp3 in DOWNLOAD_DIR, so a file must
+# never be there half-written.
 INCOMING_DIR = os.path.join(DOWNLOAD_DIR, ".incoming")
-OUT_TEMPLATE = os.path.join(INCOMING_DIR, "%(title)s [%(id)s].%(ext)s")
 
 SUBSCRIPTIONS_FILE = os.path.join(STATE_DIR, "subscriptions.json")
 ARCHIVE_FILE = os.path.join(STATE_DIR, "archive.txt")
+TASKS_FILE = os.path.join(STATE_DIR, "tasks.json")
 
-TASK_QUEUE: "Queue[dict]" = Queue()
+VIDEO_QUEUE: "Queue[dict]" = Queue()
+SUB_QUEUE: "Queue[dict]" = Queue()
 TASKS: dict[str, dict] = {}
 TASKS_LOCK = threading.Lock()
 
@@ -54,19 +70,21 @@ STATUS_QUEUED = "queued"
 STATUS_DOWNLOADING = "downloading"
 STATUS_DONE = "done"
 STATUS_ERROR = "error"
+_PENDING = (STATUS_QUEUED, STATUS_DOWNLOADING)
 
 TYPE_VIDEO = "video"
 TYPE_SUBSCRIPTION = "subscription"
 
+# Fields of yt-dlp's info.json the feed uses; the rest (formats, heatmaps,
+# automatic captions - hundreds of KB) is dropped when an episode is published.
+_INFO_KEYS = (
+    "id", "title", "description", "duration", "epoch", "timestamp", "upload_date",
+    "channel", "uploader", "channel_url", "uploader_url", "webpage_url", "thumbnail",
+)
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
-
-
-def _sanitize(name: str) -> str:
-    name = re.sub(r"[^\w\s.-]", "", name, flags=re.UNICODE)
-    name = re.sub(r"\s+", "_", name).strip("._")
-    return name[:120] or "untitled"
 
 
 def is_valid_url(url: str) -> bool:
@@ -80,14 +98,65 @@ def _ensure_dirs() -> None:
     os.makedirs(STATE_DIR, exist_ok=True)
 
 
+def _write_json(path: str, data) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
 # ---------------------------------------------------------------------------
 # Task tracking
 # ---------------------------------------------------------------------------
 
+def queue_length() -> int:
+    return VIDEO_QUEUE.qsize() + SUB_QUEUE.qsize()
+
+
+def _queue_for(task: dict) -> "Queue[dict]":
+    return VIDEO_QUEUE if task["type"] == TYPE_VIDEO else SUB_QUEUE
+
+
+def _save_tasks() -> None:
+    """Persist tasks that still have work to do, so a restart does not drop them."""
+    with TASKS_LOCK:
+        pending = [dict(t) for t in TASKS.values() if t["status"] in _PENDING]
+    try:
+        _write_json(TASKS_FILE, pending)
+    except OSError as e:
+        print(f"[tasks] failed to save {TASKS_FILE}: {e}", flush=True)
+
+
+def _load_tasks() -> None:
+    """Re-queue whatever was queued or mid-download when the process last stopped."""
+    try:
+        with open(TASKS_FILE, "r", encoding="utf-8") as f:
+            pending = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    for task in pending:
+        task["status"] = STATUS_QUEUED
+        with TASKS_LOCK:
+            TASKS[task["id"]] = task
+        _queue_for(task).put(task)
+    if pending:
+        print(f"[tasks] re-queued {len(pending)} task(s) from {TASKS_FILE}", flush=True)
+
+
+def _set(task: dict, **fields) -> None:
+    with TASKS_LOCK:
+        task.update(fields)
+    _save_tasks()
+
+
 def _record_task(task: dict) -> None:
     with TASKS_LOCK:
         TASKS[task["id"]] = task
-    TASK_QUEUE.put(task)
+        finished = [t for t in TASKS.values() if t["status"] not in _PENDING]
+        for old in finished[:-TASK_HISTORY]:
+            del TASKS[old["id"]]
+    _queue_for(task).put(task)
+    _save_tasks()
 
 
 def enqueue_download(url: str) -> str:
@@ -98,6 +167,7 @@ def enqueue_download(url: str) -> str:
         "url": url,
         "status": STATUS_QUEUED,
         "created": _now_iso(),
+        "attempts": 0,
         "filename": None,
         "error": None,
     }
@@ -107,12 +177,13 @@ def enqueue_download(url: str) -> str:
 
 def get_task(task_id: str) -> dict | None:
     with TASKS_LOCK:
-        return TASKS.get(task_id)
+        task = TASKS.get(task_id)
+        return dict(task) if task else None
 
 
 def list_tasks() -> list[dict]:
     with TASKS_LOCK:
-        return list(TASKS.values())
+        return [dict(t) for t in TASKS.values()]
 
 
 # ---------------------------------------------------------------------------
@@ -135,12 +206,9 @@ def _load_subscriptions() -> None:
 
 def _save_subscriptions() -> None:
     _ensure_dirs()
-    tmp = SUBSCRIPTIONS_FILE + ".tmp"
     with SUBS_LOCK:
         data = list(SUBSCRIPTIONS.values())
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, SUBSCRIPTIONS_FILE)
+    _write_json(SUBSCRIPTIONS_FILE, data)
 
 
 def list_subscriptions() -> list[dict]:
@@ -154,16 +222,26 @@ def get_subscription(sub_id: str) -> dict | None:
         return dict(sub) if sub else None
 
 
-def add_subscription(url: str, interval_seconds: int | None = None) -> dict:
+def add_subscription(
+    url: str, interval_seconds: int | None = None, max_items: int | None = None
+) -> dict:
     """Register a playlist/channel URL for periodic polling.
 
     The first poll is scheduled immediately (``next_poll`` = now). The
     background scheduler will pick it up within ``SCHEDULER_TICK_SECONDS``.
+
+    ``max_items`` is how many entries from the top of the list each poll looks
+    at (0 = all). Channels list newest first, so the default keeps a new
+    subscription from pulling the whole back catalogue. Playlists are finite
+    and usually grow at the end, so they default to all.
     """
+    if max_items is None:
+        max_items = 0 if "list=" in url else SUB_MAX_ITEMS
     sub = {
         "id": str(uuid.uuid4()),
         "url": url,
         "interval_seconds": int(interval_seconds or POLL_INTERVAL_SECONDS),
+        "max_items": max(0, int(max_items)),
         "added": _now_iso(),
         "last_poll": None,
         "last_result": None,
@@ -183,6 +261,7 @@ def remove_subscription(sub_id: str) -> bool:
             return False
         del SUBSCRIPTIONS[sub_id]
     _save_subscriptions()
+    shutil.rmtree(os.path.join(INCOMING_DIR, "sub-" + sub_id), ignore_errors=True)
     return True
 
 
@@ -201,13 +280,111 @@ def _enqueue_subscription_poll(sub: dict) -> str:
         "type": TYPE_SUBSCRIPTION,
         "subscription_id": sub["id"],
         "url": sub["url"],
+        "max_items": sub.get("max_items", 0),
         "status": STATUS_QUEUED,
         "created": _now_iso(),
+        "attempts": 0,
         "downloaded": [],
         "error": None,
     }
     _record_task(task)
     return str(task["id"])
+
+
+# ---------------------------------------------------------------------------
+# Episodes on disk: publishing, deleting, retention
+# ---------------------------------------------------------------------------
+
+def _trim_info(info_path: str) -> None:
+    """Rewrite yt-dlp's info.json keeping only what the feed needs."""
+    try:
+        with open(info_path, "r", encoding="utf-8") as f:
+            info = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    slim = {k: info[k] for k in _INFO_KEYS if info.get(k) is not None}
+    slim["chapters"] = [
+        {"start_time": c.get("start_time") or 0, "title": c.get("title") or ""}
+        for c in (info.get("chapters") or [])
+    ]
+    _write_json(info_path, slim)
+
+
+def _publish(incoming_mp3: str) -> str | None:
+    """Move a finished episode from its staging folder into DOWNLOAD_DIR.
+
+    Sidecars go first and the mp3 last, so the feed never shows an episode
+    without its metadata. Returns the published mp3 path.
+    """
+    if not incoming_mp3.lower().endswith(".mp3") or not os.path.exists(incoming_mp3):
+        return None
+    workdir = os.path.dirname(incoming_mp3)
+    stem = os.path.splitext(os.path.basename(incoming_mp3))[0]
+    _trim_info(os.path.join(workdir, stem + ".info.json"))
+    for ext in (".info.json", ".jpg", ".mp3"):
+        src = os.path.join(workdir, stem + ext)
+        if os.path.exists(src):
+            os.replace(src, os.path.join(DOWNLOAD_DIR, stem + ext))
+    return os.path.join(DOWNLOAD_DIR, stem + ".mp3")
+
+
+def _episodes_on_disk() -> list[dict]:
+    """Every published episode as ``{"stem", "video_id", "added"}``, newest first."""
+    if not os.path.isdir(DOWNLOAD_DIR):
+        return []
+    found = []
+    for fn in os.listdir(DOWNLOAD_DIR):
+        if not fn.lower().endswith(".mp3"):
+            continue
+        stem = os.path.splitext(fn)[0]
+        info: dict = {}
+        try:
+            with open(os.path.join(DOWNLOAD_DIR, stem + ".info.json"), "r", encoding="utf-8") as f:
+                info = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            pass
+        try:
+            mtime = os.path.getmtime(os.path.join(DOWNLOAD_DIR, fn))
+        except OSError:
+            continue
+        found.append({
+            "stem": stem,
+            "video_id": str(info.get("id") or fn),
+            "added": info.get("epoch") or mtime,
+        })
+    found.sort(key=lambda e: e["added"], reverse=True)
+    return found
+
+
+def _remove_files(stem: str) -> None:
+    for ext in (".mp3", ".jpg", ".info.json"):
+        try:
+            os.remove(os.path.join(DOWNLOAD_DIR, stem + ext))
+        except FileNotFoundError:
+            pass
+
+
+def delete_episode(video_id: str) -> bool:
+    """Remove an episode's mp3, cover and info.json. Returns False if there is no such episode."""
+    stems = [e["stem"] for e in _episodes_on_disk() if e["video_id"] == video_id]
+    for stem in stems:
+        _remove_files(stem)
+    return bool(stems)
+
+
+def prune() -> list[str]:
+    """Apply KEEP_DAYS / KEEP_COUNT. Returns the stems that were removed."""
+    if KEEP_DAYS <= 0 and KEEP_COUNT <= 0:
+        return []
+    episodes = _episodes_on_disk()
+    doomed = episodes[KEEP_COUNT:] if KEEP_COUNT > 0 else []
+    if KEEP_DAYS > 0:
+        cutoff = time.time() - KEEP_DAYS * 86400
+        doomed += [e for e in episodes if e["added"] < cutoff and e not in doomed]
+    for ep in doomed:
+        _remove_files(ep["stem"])
+        print(f"[retention] removed {ep['stem']}", flush=True)
+    return [e["stem"] for e in doomed]
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +401,7 @@ _SQUARE_THUMB = (
 )
 
 
-def _ytdlp_common_args() -> list[str]:
+def _ytdlp_common_args(workdir: str) -> list[str]:
     """Options shared by single and playlist downloads.
 
     Each episode ends up as three files with the same stem: ``.mp3`` (ID3 tags,
@@ -236,7 +413,7 @@ def _ytdlp_common_args() -> list[str]:
     return [
         "-x",
         "--audio-format", "mp3",
-        "--audio-quality", "0",
+        "--audio-quality", AUDIO_QUALITY,
         "--embed-metadata",
         "--embed-chapters",
         "--embed-thumbnail",
@@ -246,49 +423,29 @@ def _ytdlp_common_args() -> list[str]:
         "--parse-metadata", f"%(xx|{album})s:%(meta_album)s",
         "--parse-metadata", "%(xx|Podcast)s:%(meta_genre)s",
         "--write-info-json",
+        "-o", os.path.join(workdir, "%(title)s [%(id)s].%(ext)s"),
+        "--print", "after_move:filepath",
     ]
 
 
-def _publish(incoming_mp3: str) -> str | None:
-    """Move a finished episode from INCOMING_DIR into DOWNLOAD_DIR.
-
-    Sidecars go first and the mp3 last, so the feed never shows an episode
-    without its metadata. Returns the published mp3 path.
-    """
-    if not incoming_mp3.lower().endswith(".mp3") or not os.path.exists(incoming_mp3):
-        return None
-    stem = os.path.splitext(os.path.basename(incoming_mp3))[0]
-    for ext in (".info.json", ".jpg", ".mp3"):
-        src = os.path.join(INCOMING_DIR, stem + ext)
-        if os.path.exists(src):
-            os.replace(src, os.path.join(DOWNLOAD_DIR, stem + ext))
-    return os.path.join(DOWNLOAD_DIR, stem + ".mp3")
-
-
-def _clear_stale_audio() -> None:
-    """Drop mp3s left in INCOMING_DIR by an interrupted run.
+def _prepare_workdir(workdir: str) -> None:
+    """Create the staging folder and drop mp3s left there by an interrupted run.
 
     yt-dlp treats an existing mp3 as a finished conversion and would hand back
-    the truncated file. Source downloads (.webm, .part) are kept so the retry
-    can resume. Only safe while a single worker runs at a time.
+    the truncated file. Source downloads (.webm, .part) are kept so a retry
+    can resume.
     """
-    for fn in os.listdir(INCOMING_DIR):
-        if fn.lower().endswith(".mp3"):
-            os.remove(os.path.join(INCOMING_DIR, fn))
-
-
-def _ytdlp_single(url: str) -> str | None:
-    """Download one video; returns the published mp3 path or None."""
     _ensure_dirs()
-    _clear_stale_audio()
-    cmd = [
-        "yt-dlp",
-        *_ytdlp_common_args(),
-        "--no-playlist",
-        "-o", OUT_TEMPLATE,
-        "--print", "after_move:filepath",
-        "--", url,
-    ]
+    os.makedirs(workdir, exist_ok=True)
+    for fn in os.listdir(workdir):
+        if fn.lower().endswith(".mp3"):
+            os.remove(os.path.join(workdir, fn))
+
+
+def _ytdlp_single(url: str, workdir: str) -> str | None:
+    """Download one video; returns the published mp3 path or None."""
+    _prepare_workdir(workdir)
+    cmd = ["yt-dlp", *_ytdlp_common_args(workdir), "--no-playlist", "--", url]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * 60, check=False)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "yt-dlp failed")
@@ -296,23 +453,22 @@ def _ytdlp_single(url: str) -> str | None:
     return _publish(out[-1]) if out else None
 
 
-def _ytdlp_playlist(url: str) -> list[str]:
+def _ytdlp_playlist(url: str, workdir: str, max_items: int = 0) -> list[str]:
     """Download every new item in a playlist/channel. Returns paths of newly published mp3s.
 
     Uses ``--download-archive`` so previously-downloaded video IDs are skipped.
     """
-    _ensure_dirs()
-    _clear_stale_audio()
+    _prepare_workdir(workdir)
     cmd = [
         "yt-dlp",
-        *_ytdlp_common_args(),
+        *_ytdlp_common_args(workdir),
         "--ignore-errors",
         "--yes-playlist",
         "--download-archive", ARCHIVE_FILE,
-        "-o", OUT_TEMPLATE,
-        "--print", "after_move:filepath",
-        "--", url,
     ]
+    if max_items > 0:
+        cmd += ["--playlist-end", str(max_items)]
+    cmd += ["--", url]
     paths: list[str] = []
     # stderr goes to a file: a pipe nobody reads would fill up and stall yt-dlp.
     with tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as err:
@@ -339,25 +495,27 @@ def _ytdlp_playlist(url: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Worker + scheduler
+# Workers + scheduler
 # ---------------------------------------------------------------------------
 
 def _handle_video_task(task: dict) -> None:
-    final_path = _ytdlp_single(task["url"])
+    workdir = os.path.join(INCOMING_DIR, task["id"])
+    final_path = _ytdlp_single(task["url"], workdir)
     if not final_path:
         raise RuntimeError("No mp3 produced")
     task["filename"] = os.path.basename(final_path)
+    shutil.rmtree(workdir, ignore_errors=True)
 
 
 def _handle_subscription_task(task: dict) -> None:
     sub_id = task["subscription_id"]
+    workdir = os.path.join(INCOMING_DIR, "sub-" + sub_id)
     try:
-        paths = _ytdlp_playlist(task["url"])
+        paths = _ytdlp_playlist(task["url"], workdir, int(task.get("max_items") or 0))
         task["downloaded"] = [os.path.basename(p) for p in paths]
         result = {"ok": True, "new": len(paths), "at": _now_iso()}
     except Exception as e:
-        task["error"] = str(e)[:2000]
-        result = {"ok": False, "error": task["error"], "at": _now_iso()}
+        result = {"ok": False, "error": str(e)[:2000], "at": _now_iso()}
         raise
     finally:
         with SUBS_LOCK:
@@ -372,36 +530,43 @@ def _handle_subscription_task(task: dict) -> None:
         )
 
 
-def _worker() -> None:
+def _run_task(task: dict) -> None:
+    if task["type"] == TYPE_VIDEO:
+        _handle_video_task(task)
+    elif task["type"] == TYPE_SUBSCRIPTION:
+        _handle_subscription_task(task)
+    else:
+        raise RuntimeError(f"unknown task type: {task['type']}")
+
+
+def _worker(q: "Queue[dict]") -> None:
     _ensure_dirs()
     while True:
-        task = TASK_QUEUE.get()
-        if task is None:
-            break
+        task = q.get()
         try:
-            with TASKS_LOCK:
-                task["status"] = STATUS_DOWNLOADING
-                task["started"] = _now_iso()
-            if task["type"] == TYPE_VIDEO:
-                _handle_video_task(task)
-            elif task["type"] == TYPE_SUBSCRIPTION:
-                _handle_subscription_task(task)
-            else:
-                raise RuntimeError(f"unknown task type: {task['type']}")
-            with TASKS_LOCK:
-                task["status"] = STATUS_DONE
-                task["ended"] = _now_iso()
+            _set(task, status=STATUS_DOWNLOADING, started=_now_iso(),
+                 attempts=int(task.get("attempts") or 0) + 1)
+            _run_task(task)
+            _set(task, status=STATUS_DONE, ended=_now_iso(), error=None)
         except Exception as e:  # noqa: BLE001 - one bad task must not kill the worker
-            with TASKS_LOCK:
-                task["status"] = STATUS_ERROR
-                task["error"] = (task.get("error") or str(e))[:2000]
-                task["ended"] = _now_iso()
+            error = str(e)[:2000]
+            # A failed single download gets one more try; a failed poll simply
+            # runs again at the subscription's next interval.
+            if task["type"] == TYPE_VIDEO and task["attempts"] < MAX_ATTEMPTS:
+                _set(task, status=STATUS_QUEUED, error=error)
+                retry = threading.Timer(RETRY_DELAY_SECONDS, q.put, args=(task,))
+                retry.daemon = True
+                retry.start()
+            else:
+                _set(task, status=STATUS_ERROR, error=error, ended=_now_iso())
+                if task["type"] == TYPE_VIDEO:
+                    shutil.rmtree(os.path.join(INCOMING_DIR, task["id"]), ignore_errors=True)
         finally:
-            TASK_QUEUE.task_done()
+            q.task_done()
 
 
 def _scheduler() -> None:
-    """Wake on a fixed tick and enqueue polls for any due subscription."""
+    """Wake on a fixed tick: enqueue polls for due subscriptions, apply retention."""
     while True:
         try:
             now = time.time()
@@ -415,6 +580,7 @@ def _scheduler() -> None:
                 # if the worker is slow.
                 _update_subscription(sub["id"], next_poll=now + sub["interval_seconds"])
                 _enqueue_subscription_poll(sub)
+            prune()
         except Exception as e:  # noqa: BLE001 - keep the scheduler alive
             print(f"[scheduler] tick error: {e}", flush=True)
         time.sleep(SCHEDULER_TICK_SECONDS)
@@ -426,9 +592,9 @@ def _scheduler() -> None:
 
 _ensure_dirs()
 _load_subscriptions()
+_load_tasks()
 
-_worker_thread = threading.Thread(target=_worker, daemon=True, name="ytps-worker")
-_worker_thread.start()
+for _name, _queue in (("ytps-video", VIDEO_QUEUE), ("ytps-subs", SUB_QUEUE)):
+    threading.Thread(target=_worker, args=(_queue,), daemon=True, name=_name).start()
 
-_scheduler_thread = threading.Thread(target=_scheduler, daemon=True, name="ytps-scheduler")
-_scheduler_thread.start()
+threading.Thread(target=_scheduler, daemon=True, name="ytps-scheduler").start()
