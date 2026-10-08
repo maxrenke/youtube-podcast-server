@@ -58,6 +58,12 @@ def _fmt_duration(seconds) -> str:
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
 
+def _fmt_length(seconds) -> str:
+    """Episode length as ``1h 37m``. Not ``1:37:10``: players turn that into a seek link."""
+    h, m = divmod(int(seconds or 0) // 60, 60)
+    return f"{h}h {m:02d}m" if h else f"{m}m"
+
+
 def _fmt_upload_date(yyyymmdd: str) -> str:
     if len(yyyymmdd) == 8 and yyyymmdd.isdigit():
         return f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:]}"
@@ -109,12 +115,12 @@ def list_episodes():
 
 def _episode_byline(ep) -> str:
     """One line of source metadata shown above the description, e.g.
-    ``Professor Dave Explains - uploaded 2025-04-26 - 1:37:10``."""
+    ``Professor Dave Explains - uploaded 2025-04-26 - 1h 37m``."""
     parts = [ep["uploader"]]
     if ep["upload_date"]:
         parts.append("uploaded " + ep["upload_date"])
     if ep["duration"]:
-        parts.append(_fmt_duration(ep["duration"]))
+        parts.append(_fmt_length(ep["duration"]))
     return " - ".join(p for p in parts if p)
 
 

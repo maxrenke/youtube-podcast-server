@@ -225,7 +225,7 @@ What each RSS `<item>` carries:
 |-------------------------|--------------------------------------------------------------------------|
 | `<title>`               | Video title.                                                             |
 | `<link>`                | The video's URL.                                                         |
-| `<description>`         | Plain text: `Channel - uploaded YYYY-MM-DD - H:MM:SS`, the video URL, then the full video description. |
+| `<description>`         | Plain text: `Channel - uploaded YYYY-MM-DD - 1h 37m`, the video URL, then the full video description. |
 | `<content:encoded>`     | The same as HTML show notes: channel link, "Watch the original video", description with clickable links, chapter list. |
 | `<pubDate>`             | When the episode was **added** (yt-dlp's `epoch`), not the upload date, so a newly queued old video sorts to the top in the app. The upload date is in the description. |
 | `<itunes:image>`        | `/thumb/<stem>.jpg`; falls back to YouTube's thumbnail URL for files downloaded before covers were saved. |
