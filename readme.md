@@ -5,7 +5,7 @@ feed. Single-file downloads run on demand; playlist/channel subscriptions are
 re-polled on a schedule so new uploads get pulled automatically.
 
 ```
-[ you ] --POST /download--+              +--> downloads/ (mp3 + .info.json)
+[ you ] --POST /download--+              +--> downloads/ (mp3 + .jpg + .info.json)
                           |              |
 [ you ] --POST /subscrip-+--> task queue --+--> /rss <-- podcast app subscribes
 [ scheduler tick ] ------+              |
@@ -15,7 +15,13 @@ re-polled on a schedule so new uploads get pulled automatically.
 ## Features
 
 - **Single-video downloads** - POST a video URL, get an mp3 with embedded
-  thumbnail and metadata.
+  cover art, ID3 tags and chapters.
+- **Episodes carry the video's metadata** - title, channel, upload date,
+  full description, chapter list, a square version of the thumbnail and a link
+  back to the video, both inside the mp3 and in the RSS item. See
+  [Episode metadata](#episode-metadata).
+- **Feed artwork and description** - `artwork.jpg` is served as the podcast
+  cover; title, description, author and category come from env vars.
 - **Playlist and channel subscriptions** - POST a playlist or channel URL once,
   server polls it every hour (configurable) and only pulls IDs it hasn't seen
   before (`yt-dlp --download-archive`).
@@ -55,8 +61,11 @@ All via env vars. Defaults shown.
 | `POLL_INTERVAL_SECONDS`   | `3600`                           | How often each subscription is re-polled.                                            |
 | `SCHEDULER_TICK_SECONDS`  | `60`                             | How often the scheduler checks for due subscriptions.                                |
 | `FEED_TITLE`              | `YouTube Podcast`                | `<channel><title>` in the RSS.                                                       |
-| `FEED_DESC`               | `Personal YouTube-to-podcast...` | `<channel><description>`.                                                            |
-| `FEED_AUTHOR`             | `Max Renke`                      | `<itunes:author>`.                                                                   |
+| `FEED_DESC`               | `A personal listen-later queue..`| `<channel><description>` and `<itunes:summary>`.                                     |
+| `FEED_AUTHOR`             | `Max Renke`                      | `<itunes:author>` and `<itunes:owner>` name.                                         |
+| `FEED_EMAIL`              | unset                            | `<itunes:owner>` email. Left out of the feed when unset.                             |
+| `FEED_CATEGORY`           | `Technology`                     | `<itunes:category>`. Must be one of Apple's category names.                          |
+| `FEED_PRIVATE`            | `1`                              | Emits `<itunes:block>Yes</itunes:block>` so directories do not list the feed. `0` to drop it. |
 | `TZ`                      | unset                            | Timezone for the container's logs.                                                   |
 
 **`PUBLIC_BASE_URL` matters.** If your phone is on a different network than
@@ -91,13 +100,16 @@ HTML page with forms for submitting URLs and managing subscriptions.
 
 ### `GET /rss` - podcast feed
 
-`application/rss+xml`. One `<item>` per mp3 in `DOWNLOAD_DIR`. The list is
-derived from the filesystem on every request, so deleting an mp3 manually
-just makes it disappear from the feed.
+`application/rss+xml`. One `<item>` per mp3 in the top level of
+`DOWNLOAD_DIR`, newest addition first. The list is derived from the
+filesystem on every request, so removing an mp3 makes it disappear from the
+feed (see [Removing episodes](#removing-episodes)).
 
 ### `GET /episodes` - JSON list
 
-Same data the RSS is built from, as JSON.
+Same data the RSS is built from, as JSON: `filename`, `title`, `description`,
+`duration`, `size`, `added`, `video_id`, `thumbnail`, `uploader`,
+`channel_url`, `webpage_url`, `upload_date`, `chapters`.
 
 ### `POST /download` - one-shot video download
 
@@ -115,6 +127,10 @@ Response:
 
 Uses `yt-dlp --no-playlist`, so if you paste a video URL that happens to
 have a `&list=` parameter, only that single video is pulled.
+
+The URL must start with `http://` or `https://`; anything else gets
+`400 {"error": "url must start with http:// or https://"}`. The same rule
+applies to `POST /subscriptions`.
 
 ### `POST /subscriptions` - subscribe to a playlist or channel
 
@@ -176,6 +192,72 @@ kept in memory only - they're for live status, not long-term audit.
 Streams the file with `Accept-Ranges: bytes` so podcast apps can do partial
 GETs.
 
+### `GET /thumb/<filename>.jpg` - episode cover
+
+The square cover saved next to each mp3. Referenced by the item's
+`<itunes:image>`.
+
+### `GET /artwork.jpg` - podcast cover
+
+The feed-level image (`artwork.jpg` in the repo, 1400x1400). Replace the file
+and rebuild to change it.
+
+### `HEAD` on any GET route
+
+Returns the same status and headers without the body. Podcast clients and
+feed validators probe enclosures this way.
+
+## Episode metadata
+
+Every download runs yt-dlp with one shared option list
+(`_ytdlp_common_args` in `tasks.py`) and leaves three files with the same
+stem in `DOWNLOAD_DIR`:
+
+| File                    | Contents                                                                 |
+|-------------------------|--------------------------------------------------------------------------|
+| `Title [id].mp3`        | Audio plus ID3: title, artist (channel), date, description, source URL, album (`FEED_TITLE`), genre `Podcast`, chapters, and the square cover. |
+| `Title [id].jpg`        | 1400x1400 cover: the 16:9 thumbnail centred over a blurred fill of itself, so nothing is cropped. |
+| `Title [id].info.json`  | yt-dlp's full metadata dump; the RSS item is built from it.              |
+
+What each RSS `<item>` carries:
+
+| Tag                     | Source                                                                   |
+|-------------------------|--------------------------------------------------------------------------|
+| `<title>`               | Video title.                                                             |
+| `<link>`                | The video's URL.                                                         |
+| `<description>`         | Plain text: `Channel - uploaded YYYY-MM-DD - H:MM:SS`, the video URL, then the full video description. |
+| `<content:encoded>`     | The same as HTML show notes: channel link, "Watch the original video", description with clickable links, chapter list. |
+| `<pubDate>`             | When the episode was **added** (yt-dlp's `epoch`), not the upload date, so a newly queued old video sorts to the top in the app. The upload date is in the description. |
+| `<itunes:image>`        | `/thumb/<stem>.jpg`; falls back to YouTube's thumbnail URL for files downloaded before covers were saved. |
+| `<itunes:author>`       | Channel name.                                                            |
+| `<itunes:duration>`     | Seconds.                                                                 |
+| `<guid>`                | Video id.                                                                |
+
+Chapters live inside the mp3 (ID3 `CHAP` frames), so players that read file
+chapters show them once the episode is downloaded or streaming.
+
+Feed-level tags: `<image>`, `<itunes:image>`, `<itunes:summary>`,
+`<itunes:owner>`, `<itunes:type>`, `<itunes:category>`, `<itunes:block>`,
+`<atom:link rel="self">`.
+
+Podcast apps cache feeds on their own servers. After a change here, expect a
+delay (Pocket Casts: up to an hour or a manual refresh) before the app shows
+it, and already-downloaded episodes keep the file they have.
+
+## Removing episodes
+
+There is no delete endpoint. Remove (or move out of the top level of
+`DOWNLOAD_DIR`) the three files for an episode:
+
+```bash
+cd /DATA/AppData/youtube-podcast-server/downloads
+sudo rm "Title [id].mp3" "Title [id].jpg" "Title [id].info.json"
+```
+
+Files inside a subfolder are ignored by the feed, so `mkdir _hold && mv ...`
+also works. If the video came from a subscription, its id stays in
+`STATE_DIR/archive.txt` and it will not be downloaded again.
+
 ## How the polling works
 
 ```
@@ -204,7 +286,9 @@ duplicate downloads.
 | Path                          | What it is                                                        |
 |-------------------------------|-------------------------------------------------------------------|
 | `DOWNLOAD_DIR/*.mp3`          | The audio files served at `/audio/<filename>`.                    |
-| `DOWNLOAD_DIR/*.info.json`    | yt-dlp metadata sidecar; powers RSS titles, durations, thumbnails.|
+| `DOWNLOAD_DIR/*.jpg`          | Square episode cover served at `/thumb/<filename>`.               |
+| `DOWNLOAD_DIR/.incoming/`     | Staging folder yt-dlp works in. Finished episodes are moved up one level (mp3 last), so the feed never lists a half-written file. Leftovers here are from failed or interrupted downloads and are reused on retry. |
+| `DOWNLOAD_DIR/*.info.json`    | yt-dlp metadata sidecar; powers RSS titles, show notes, durations.|
 | `STATE_DIR/subscriptions.json`| All registered subscriptions and their schedules.                 |
 | `STATE_DIR/archive.txt`       | yt-dlp dedup log (`youtube VIDEO_ID` per line).                   |
 
@@ -213,7 +297,9 @@ In the provided `docker-compose.yml` both directories are bind-mounted to
 
 ## Local development (no Docker)
 
-Prereqs: Python 3.11+, `yt-dlp` on PATH, `ffmpeg` on PATH.
+Prereqs: Python 3.11+, `yt-dlp` on PATH, `ffmpeg` on PATH. Lint and type
+checks run as pre-commit hooks (`ruff check`, `mypy`); both must pass to
+commit.
 
 ```bash
 python rss_downloader.py
@@ -226,6 +312,21 @@ Override anything via env vars:
 PORT=9000 POLL_INTERVAL_SECONDS=900 \
     PUBLIC_BASE_URL=https://example.com python rss_downloader.py
 ```
+
+## Deploying
+
+```powershell
+.\deploy.ps1                      # push master, pull + rebuild on the box, print /health
+.\deploy.ps1 -Message "fix bug"   # commit everything first
+```
+
+The box (`ssh casaos`, repo at `~/youtube-podcast-server`) runs
+`git pull --ff-only && docker compose up -d --build`. A rebuild also fetches
+the latest yt-dlp release, which is the usual fix when YouTube downloads
+start failing.
+
+The live instance is published at `https://podcast.maxrenke.com` through a
+Cloudflare Tunnel (`casaos`) to `http://172.17.0.1:5757`.
 
 ## Subscribing in a podcast app
 
@@ -263,7 +364,10 @@ PORT=9000 POLL_INTERVAL_SECONDS=900 \
 ## Security
 
 There is no authentication. Anyone who can reach the server can queue
-downloads. If you're exposing this publicly:
+downloads and add or remove subscriptions. Request URLs are restricted to
+`http(s)://` and passed to yt-dlp after `--`, so a request cannot inject
+yt-dlp options, but it can still make the box download arbitrary media and
+fill the disk. If you're exposing this publicly:
 
 - Put it behind Cloudflare Access (Zero Trust), an OAuth proxy
   (oauth2-proxy), or basic auth via your reverse proxy.

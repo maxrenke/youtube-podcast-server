@@ -20,6 +20,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -33,6 +34,11 @@ SCHEDULER_TICK_SECONDS = int(os.environ.get("SCHEDULER_TICK_SECONDS", "60"))
 
 # ID3 album tag written into every mp3; rss_downloader uses the same value as the feed title.
 FEED_TITLE = os.environ.get("FEED_TITLE", "YouTube Podcast")
+
+# yt-dlp works in INCOMING_DIR; finished episodes are moved up into DOWNLOAD_DIR.
+# The feed lists every mp3 in DOWNLOAD_DIR, so a file must never be there half-written.
+INCOMING_DIR = os.path.join(DOWNLOAD_DIR, ".incoming")
+OUT_TEMPLATE = os.path.join(INCOMING_DIR, "%(title)s [%(id)s].%(ext)s")
 
 SUBSCRIPTIONS_FILE = os.path.join(STATE_DIR, "subscriptions.json")
 ARCHIVE_FILE = os.path.join(STATE_DIR, "archive.txt")
@@ -70,6 +76,7 @@ def is_valid_url(url: str) -> bool:
 
 def _ensure_dirs() -> None:
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    os.makedirs(INCOMING_DIR, exist_ok=True)
     os.makedirs(STATE_DIR, exist_ok=True)
 
 
@@ -242,13 +249,30 @@ def _ytdlp_common_args() -> list[str]:
     ]
 
 
-def _ytdlp_single(url: str, out_template: str) -> str | None:
-    """Download one video; returns the final mp3 path or None."""
+def _publish(incoming_mp3: str) -> str | None:
+    """Move a finished episode from INCOMING_DIR into DOWNLOAD_DIR.
+
+    Sidecars go first and the mp3 last, so the feed never shows an episode
+    without its metadata. Returns the published mp3 path.
+    """
+    if not incoming_mp3.lower().endswith(".mp3") or not os.path.exists(incoming_mp3):
+        return None
+    stem = os.path.splitext(os.path.basename(incoming_mp3))[0]
+    for ext in (".info.json", ".jpg", ".mp3"):
+        src = os.path.join(INCOMING_DIR, stem + ext)
+        if os.path.exists(src):
+            os.replace(src, os.path.join(DOWNLOAD_DIR, stem + ext))
+    return os.path.join(DOWNLOAD_DIR, stem + ".mp3")
+
+
+def _ytdlp_single(url: str) -> str | None:
+    """Download one video; returns the published mp3 path or None."""
+    _ensure_dirs()
     cmd = [
         "yt-dlp",
         *_ytdlp_common_args(),
         "--no-playlist",
-        "-o", out_template,
+        "-o", OUT_TEMPLATE,
         "--print", "after_move:filepath",
         "--", url,
     ]
@@ -256,11 +280,11 @@ def _ytdlp_single(url: str, out_template: str) -> str | None:
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "yt-dlp failed")
     out = proc.stdout.strip().splitlines()
-    return out[-1] if out else None
+    return _publish(out[-1]) if out else None
 
 
-def _ytdlp_playlist(url: str, out_template: str) -> list[str]:
-    """Download every new item in a playlist/channel. Returns paths of newly downloaded mp3s.
+def _ytdlp_playlist(url: str) -> list[str]:
+    """Download every new item in a playlist/channel. Returns paths of newly published mp3s.
 
     Uses ``--download-archive`` so previously-downloaded video IDs are skipped.
     """
@@ -271,17 +295,32 @@ def _ytdlp_playlist(url: str, out_template: str) -> list[str]:
         "--ignore-errors",
         "--yes-playlist",
         "--download-archive", ARCHIVE_FILE,
-        "-o", out_template,
+        "-o", OUT_TEMPLATE,
         "--print", "after_move:filepath",
         "--", url,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * 60 * 6, check=False)
-    # With --ignore-errors yt-dlp may exit non-zero even with partial success.
-    # Capture printed filepaths regardless; surface stderr only if nothing landed.
-    paths = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-    paths = [p for p in paths if p.lower().endswith(".mp3") and os.path.exists(p)]
+    paths: list[str] = []
+    # stderr goes to a file: a pipe nobody reads would fill up and stall yt-dlp.
+    with tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as err:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, text=True)
+        killer = threading.Timer(60 * 60 * 6, proc.kill)
+        killer.start()
+        try:
+            # yt-dlp prints each finished file; publish it right away instead of
+            # holding every episode back until the whole poll is done.
+            for line in proc.stdout or []:
+                published = _publish(line.strip())
+                if published:
+                    paths.append(published)
+            proc.wait()
+        finally:
+            killer.cancel()
+        err.seek(0)
+        stderr = err.read()
+    # With --ignore-errors yt-dlp may exit non-zero even with partial success;
+    # surface stderr only if nothing landed.
     if proc.returncode != 0 and not paths:
-        raise RuntimeError(proc.stderr.strip()[-2000:] or "yt-dlp failed")
+        raise RuntimeError(stderr.strip()[-2000:] or "yt-dlp failed")
     return paths
 
 
@@ -290,23 +329,16 @@ def _ytdlp_playlist(url: str, out_template: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _handle_video_task(task: dict) -> None:
-    out_template = os.path.join(DOWNLOAD_DIR, "%(title)s [%(id)s].%(ext)s")
-    final_path = _ytdlp_single(task["url"], out_template)
-    if final_path and os.path.exists(final_path):
-        task["filename"] = os.path.basename(final_path)
-    else:
-        mp3s = [f for f in os.listdir(DOWNLOAD_DIR) if f.endswith(".mp3")]
-        if not mp3s:
-            raise RuntimeError("No mp3 produced")
-        mp3s.sort(key=lambda f: os.path.getmtime(os.path.join(DOWNLOAD_DIR, f)), reverse=True)
-        task["filename"] = mp3s[0]
+    final_path = _ytdlp_single(task["url"])
+    if not final_path:
+        raise RuntimeError("No mp3 produced")
+    task["filename"] = os.path.basename(final_path)
 
 
 def _handle_subscription_task(task: dict) -> None:
     sub_id = task["subscription_id"]
-    out_template = os.path.join(DOWNLOAD_DIR, "%(title)s [%(id)s].%(ext)s")
     try:
-        paths = _ytdlp_playlist(task["url"], out_template)
+        paths = _ytdlp_playlist(task["url"])
         task["downloaded"] = [os.path.basename(p) for p in paths]
         result = {"ok": True, "new": len(paths), "at": _now_iso()}
     except Exception as e:

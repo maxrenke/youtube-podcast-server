@@ -2,11 +2,13 @@
 
 ## Project Overview
 
-This is a lightweight Python application that downloads YouTube videos as audio files and serves them via an RSS feed. The project consists of a single main file: `rss_downloader.py`.
+A small Python service that downloads YouTube videos as mp3 and serves them as a podcast RSS feed.
+Two modules: `rss_downloader.py` (HTTP server, RSS, UI) and `tasks.py` (queue, worker, subscriptions, yt-dlp calls).
+See `readme.md` for the API, configuration and metadata details, and `youtube-podcast-server-TODO.md` for audit findings and proposals.
 
 ## Tech Stack
 
-- **Language**: Python 3.9+
+- **Language**: Python 3.11+ (image uses 3.12); stdlib only, no requirements.txt
 - **Dependencies**: yt-dlp (YouTube downloading), ffmpeg (audio processing)
 - **Built-in modules**: http.server, socketserver, urllib, xml.sax.saxutils
 - **Container**: Docker
@@ -18,19 +20,11 @@ This is a lightweight Python application that downloads YouTube videos as audio 
 ### Local Development
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# Needs yt-dlp and ffmpeg on PATH. Starts the server on 0.0.0.0:8080.
+python rss_downloader.py
 
-# Download a single YouTube video as audio
-python rss_downloader.py "https://www.youtube.com/watch?v=VIDEO_ID"
-
-# Start the HTTP server
-python rss_downloader.py --server
-
-# Install ffmpeg (required for audio processing)
-# macOS: brew install ffmpeg
-# Ubuntu/Debian: sudo apt-get install ffmpeg
-# Windows: Download from https://ffmpeg.org/download.html
+# Queue a download
+curl -X POST http://localhost:8080/download -H "Content-Type: application/json" \n  -d '{"url": "https://www.youtube.com/watch?v=VIDEO_ID"}'
 ```
 
 ### Docker
@@ -173,50 +167,26 @@ def download_audio(youtube_url: str) -> None:
 
 ```
 youtube-podcast-server/
-├── rss_downloader.py      # Main application
-├── requirements.txt       # Python dependencies
-├── Dockerfile            # Container configuration
-├── docker-compose.yml    # Docker Compose config
-├── downloads/            # Downloaded audio files (runtime-created)
-└── AGENTS.md            # This file
+|- rss_downloader.py      # HTTP server, RSS generation, inline UI
+|- tasks.py               # task queue, worker, scheduler, yt-dlp invocations
+|- artwork.jpg            # podcast cover served at /artwork.jpg
+|- Dockerfile, docker-compose.yml, deploy.ps1
+|- readme.md              # user and API documentation
+|- youtube-podcast-server-TODO.md   # audit findings and proposals
+|- downloads/, state/     # runtime data (git-ignored)
 ```
 
 ---
 
-## API Reference
+## API and configuration
 
-### HTTP Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/rss` | RSS feed of all downloaded audio |
-| GET | `/audio/<filename>` | Serve individual audio file |
-| POST | `/download` | Download a YouTube URL |
-
-### Download API Example
-
-```bash
-curl -X POST http://localhost:5757/download \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://www.youtube.com/watch?v=VIDEO_ID"}'
-```
-
----
-
-## Configuration
-
-Key variables at the top of `rss_downloader.py`:
-
-- `DOWNLOAD_DIR`: Directory for downloaded files (default: `"downloads"`)
-- `AUDIO_EXT`: Audio file extension (default: `".mp3"`)
-
-The server port is set in `run_server()` (default: `8080`, exposed as `5757` in Docker).
+Documented in `readme.md` (HTTP API, env vars, episode metadata). Keep that file in sync with any route or option change.
 
 ---
 
 ## Notes for Agents
 
-1. **No existing tests**: This project lacks automated tests. Consider adding pytest tests for any new functionality.
-2. **yt-dlp binary**: In Docker, the project uses the standalone yt-dlp binary, not the pip package.
-3. **RSS URL hardcoding**: The RSS feed generator has hardcoded URLs (`http://casaos.local:5757/`) - consider making this configurable.
-4. **Security**: No authentication is implemented. The server is intended for local/personal use only.
+1. **No existing tests**: add pytest tests for new logic where practical.
+2. **yt-dlp binary**: in Docker the standalone yt-dlp binary is used, fetched at build time.
+3. **Pre-commit**: `ruff check` and `mypy` must pass; do not bypass the hook.
+4. **Security**: no authentication. The live instance is public through a Cloudflare Tunnel, so treat every request field as hostile (URLs are validated in `tasks.is_valid_url` and passed to yt-dlp after `--`).
