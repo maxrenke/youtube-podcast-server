@@ -536,6 +536,9 @@ def _ytdlp_playlist(url: str, workdir: str, max_items: int = 0) -> list[str]:
         "--ignore-errors",
         "--yes-playlist",
         "--download-archive", ARCHIVE_FILE,
+        # Members-only videos cannot be fetched; skip them quietly instead of
+        # failing the poll every hour.
+        "--match-filter", "availability!=subscriber_only",
     ]
     if max_items > 0:
         cmd += ["--playlist-end", str(max_items)]

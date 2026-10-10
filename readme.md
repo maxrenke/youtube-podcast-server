@@ -213,7 +213,8 @@ curl -X POST http://localhost:5757/subscriptions \
 A channel address in any form is stored as that channel's **Videos tab**, so a
 subscription follows uploads only - no Shorts, no live streams. The response
 shows the address that was stored. Subscribing to something already
-subscribed returns the existing entry instead of adding a second one.
+subscribed returns the existing entry instead of adding a second one. Members-only
+videos are skipped.
 
 Accepted:
 
