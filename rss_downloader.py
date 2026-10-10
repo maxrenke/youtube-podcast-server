@@ -320,32 +320,68 @@ def generate_rss(feed: str = "", path: str = "/rss"):
     return "\n".join(out)
 
 
+# One dark theme for every page. Colours are named by role; spacing steps are 4/8/12/16/24/32 px.
+_THEME_CSS = """
+:root{color-scheme:dark;--bg:#0f1117;--surface:#171a23;--raised:#1e222d;--border:#2a2f3c;--text:#e8eaf0;
+--muted:#9aa1b2;--link:#8ab4ff;--accent:#d93036;--accent-hover:#e5484d;--ok:#3dd68c;--warn:#f5a524;--danger:#ff6369;
+--radius:10px;--radius-sm:6px}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+a{color:var(--link);text-decoration:none}
+a:hover{text-decoration:underline}
+h1,h2,h3,p{margin:0}
+:focus-visible{outline:2px solid var(--text);outline-offset:2px}
+input{font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);
+padding:8px 12px;width:100%;min-width:0}
+input::placeholder{color:var(--muted)}
+input:focus-visible{outline-offset:0;border-color:var(--text)}
+.btn{font:inherit;font-weight:600;color:var(--text);background:var(--raised);border:1px solid var(--border);
+border-radius:var(--radius-sm);padding:8px 16px;cursor:pointer;white-space:nowrap}
+.btn:hover{border-color:var(--muted);text-decoration:none}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{background:var(--accent-hover);border-color:var(--accent-hover)}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--muted);padding:4px 8px;font-weight:500;font-size:13px}
+.btn.ghost:hover{color:var(--text);background:var(--raised)}
+.btn.ghost.danger:hover{color:var(--danger)}
+.btn.danger-solid{background:transparent;border-color:var(--danger);color:var(--danger)}
+.btn.danger-solid:hover{background:var(--danger);color:#14161f}
+.muted{color:var(--muted)}
+.small{font-size:13px}
+.msg{padding:8px 12px;border-radius:var(--radius-sm);border:1px solid var(--danger);color:var(--danger);margin-bottom:16px}
+.msg.ok{border-color:var(--ok);color:var(--ok)}
+"""
+
 _PAGE = """<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>__TITLE__ - YouTube Podcast</title>
-<style>
-body{font-family:system-ui,sans-serif;max-width:360px;margin:12vh auto;padding:0 1rem}
-h1{font-size:1.3rem}
-label{display:block;margin:.8rem 0 .25rem;font-weight:600}
-input{font-size:1rem;padding:.5rem;width:100%;box-sizing:border-box}
-button{font-size:1rem;padding:.55rem 1rem;margin-top:1.1rem}
-.msg{padding:.6rem .8rem;border-radius:6px;background:#fee;border:1px solid #c66;color:#a00}
-.msg.ok{background:#efe;border-color:#6a6;color:#060}
-.muted{color:#666;font-size:.85em}
+<style nonce="__NONCE__">__THEME__
+body{display:grid;place-items:center;min-height:100vh;padding:16px}
+main{width:100%;max-width:380px}
+.brand{display:flex;align-items:center;gap:12px;margin-bottom:24px;font-weight:600;font-size:17px}
+.brand img{width:40px;height:40px;border-radius:var(--radius-sm)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:24px}
+h1{font-size:20px;margin-bottom:16px}
+label{display:block;margin:16px 0 4px;font-weight:600;font-size:13px}
+form .btn{width:100%;margin-top:24px}
+.card p.muted{margin-bottom:8px}
 </style>
-<h1>__TITLE__</h1>
+<main>
+<div class="brand"><img src="/artwork.jpg" alt="" width="40" height="40">YouTube Podcast</div>
+<div class="card"><h1>__TITLE__</h1>
 __BODY__
-</html>"""
+</div>
+</main>
+</html>""".replace("__THEME__", _THEME_CSS)
 
 _LOGIN_FORM = """<form method="post" action="/login">
 <label for="u">User name</label><input id="u" name="username" autocomplete="username" required autofocus>
 <label for="p">Password</label><input id="p" name="password" type="password" autocomplete="current-password" required>
 <label for="c">Two-step code <span class="muted">(if turned on)</span></label>
 <input id="c" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="8">
-<button>Sign in</button>
+<button class="btn primary">Sign in</button>
 </form>"""
 
-_SETUP_FORM = """<p class="muted">Creates the admin account, or replaces it if you forgot the password.
+_SETUP_FORM = """<p class="muted small">Creates the admin account, or replaces it if you forgot the password.
 The API token proves you control the server; it is the API_TOKEN value in the server's .env file.</p>
 <form method="post" action="/setup">
 <label for="t">API token</label><input id="t" name="token" type="password" autocomplete="off" required>
@@ -354,7 +390,7 @@ The API token proves you control the server; it is the API_TOKEN value in the se
 <input id="p" name="password" type="password" autocomplete="new-password" minlength="12" required>
 <label for="p2">New password again</label>
 <input id="p2" name="password2" type="password" autocomplete="new-password" minlength="12" required>
-<button>Save</button>
+<button class="btn primary">Save</button>
 </form>"""
 
 
@@ -363,56 +399,139 @@ def _message(text: str, ok: bool = False) -> str:
 
 
 INDEX_HTML = """<!doctype html>
-<meta charset="utf-8"><title>YouTube Podcast</title>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>YouTube Podcast</title>
 <meta name="csrf" content="__CSRF__">
-<style>
-body{font-family:system-ui,sans-serif;max-width:820px;margin:2rem auto;padding:0 1rem}
-input,button{font-size:1rem;padding:.5rem}
-input{width:65%}
-.ep,.sub{border-bottom:1px solid #ddd;padding:.5rem 0}
-.ep{display:flex;gap:.75rem}
-.ep img{width:96px;height:96px;object-fit:cover;border-radius:6px;flex:none}
-.ep audio{width:100%;margin-top:.25rem}
-.ep pre{white-space:pre-wrap;font:inherit;font-size:.85em;margin:.25rem 0}
-.muted{color:#666;font-size:.85em}
-.row{display:flex;gap:.5rem;align-items:center}
-button.danger{background:#fee;border:1px solid #c66;color:#a00}
-h2{margin-top:1.5rem}
+<style nonce="__NONCE__">__THEME__
+header{position:sticky;top:0;z-index:1;background:var(--bg);border-bottom:1px solid var(--border)}
+.bar{max-width:960px;margin:0 auto;padding:12px 16px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:12px;font-weight:600;font-size:17px;margin-right:auto}
+.brand img{width:32px;height:32px;border-radius:var(--radius-sm)}
+#account{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.pill{font-size:12px;font-weight:600;padding:2px 8px;border-radius:999px;border:1px solid var(--border);color:var(--muted)}
+.pill.ok,.pill.done{color:var(--ok);border-color:var(--ok)}
+.pill.warn,.pill.queued,.pill.downloading{color:var(--warn);border-color:var(--warn)}
+.pill.error{color:var(--danger);border-color:var(--danger)}
+main{max-width:960px;margin:0 auto;padding:24px 16px 32px;display:grid;gap:24px}
+section{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px}
+section>h2{font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:12px;
+display:flex;justify-content:space-between;gap:8px}
+section>h2 span{text-transform:none;letter-spacing:0;font-weight:500}
+.add{display:flex;gap:8px;flex-wrap:wrap}
+.add input{flex:1 1 280px}
+.feed{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px}
+.feed code{font:13px ui-monospace,Consolas,monospace;background:var(--bg);border:1px solid var(--border);
+border-radius:var(--radius-sm);padding:4px 8px;overflow-wrap:anywhere}
+ul{list-style:none;margin:0;padding:0}
+.row{display:flex;gap:12px;align-items:flex-start;padding:12px 0;border-top:1px solid var(--border)}
+.row:first-child{border-top:0;padding-top:0}
+.row:last-child{padding-bottom:0}
+.grow{flex:1;min-width:0}
+.title{font-size:15px;font-weight:600;overflow-wrap:anywhere}
+.meta{font-size:13px;color:var(--muted);display:flex;flex-wrap:wrap;row-gap:4px;margin-top:4px}
+.meta span:not(:last-child){margin-right:8px;padding-right:8px;border-right:1px solid var(--border)}
+.cover{width:72px;height:72px;border-radius:var(--radius-sm);object-fit:cover;flex:none;background:var(--raised)}
+audio{width:100%;height:36px;margin-top:8px}
+details{margin-top:8px}
+summary{cursor:pointer;color:var(--muted);font-size:13px}
+details pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;font-size:13px;color:var(--muted);margin:8px 0 0;
+max-height:240px;overflow:auto;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px}
+.actions{display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex:none}
+.task{align-items:center}
+.task .url{overflow-wrap:anywhere}
+.empty{color:var(--muted);padding:8px 0}
+dialog{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:var(--radius);padding:24px;
+width:min(420px,calc(100vw - 32px))}
+dialog::backdrop{background:rgba(0,0,0,.6)}
+dialog h2{font-size:17px;margin-bottom:8px}
+dialog p{color:var(--muted);margin-bottom:12px;overflow-wrap:anywhere}
+dialog code{display:block;font:15px ui-monospace,Consolas,monospace;color:var(--text);background:var(--bg);
+border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px 12px;margin-bottom:12px;overflow-wrap:anywhere}
+dialog .err{color:var(--danger);min-height:22px;margin:8px 0 0}
+dialog .buttons{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--raised);border:1px solid var(--border);
+border-radius:var(--radius-sm);padding:8px 16px;max-width:calc(100vw - 32px)}
+#toast.error{border-color:var(--danger);color:var(--danger)}
+#toast:empty{display:none}
+@media (max-width:560px){.add input{flex-basis:100%}.add .btn{flex:1}.cover{width:56px;height:56px}.actions{flex-direction:row}.row.ep{flex-wrap:wrap}
+.row.ep .actions{width:100%;justify-content:flex-end}}
+@media (prefers-reduced-motion:no-preference){.btn,input{transition:border-color .12s,background-color .12s,color .12s}}
 </style>
-<h1><img src="/artwork.jpg" alt="" style="width:48px;height:48px;border-radius:8px;vertical-align:middle"> YouTube Podcast</h1>
-<p>Feed: <a id="feed" href="/feed">/feed</a> <span id="feeds" class="muted"></span></p>
-<div id="account" class="muted"></div>
-<div id="twostep" hidden>
+<header><div class="bar">
+  <div class="brand"><img src="/artwork.jpg" alt="" width="32" height="32">YouTube Podcast</div>
+  <div id="account" class="small"></div>
+</div></header>
+<main>
+  <section aria-labelledby="addH">
+    <h2 id="addH">Add</h2>
+    <form id="addForm" class="add">
+      <input id="addUrl" type="url" inputmode="url" required aria-label="YouTube address"
+             placeholder="Paste a YouTube video, playlist or channel address">
+      <button class="btn primary" name="kind" value="video">Add video</button>
+      <button class="btn" name="kind" value="subscription">Subscribe</button>
+    </form>
+    <p class="muted small feed">Subscriptions are checked every hour: a channel's newest 10 uploads, a playlist whole.</p>
+    <div class="feed small"><span class="muted">Feed</span><code id="feedUrl"></code>
+      <button class="btn ghost" id="copyFeed" type="button">Copy</button><span id="feeds" class="muted"></span></div>
+  </section>
+  <section aria-labelledby="actH" id="activity" hidden>
+    <h2 id="actH">Activity</h2><ul id="tasks"></ul>
+  </section>
+  <section aria-labelledby="subH">
+    <h2 id="subH">Subscriptions</h2><ul id="subs" aria-busy="true"><li class="empty">Loading...</li></ul>
+  </section>
+  <section aria-labelledby="epH">
+    <h2 id="epH">Episodes <span id="epCount"></span></h2><ul id="eps" aria-busy="true"><li class="empty">Loading...</li></ul>
+  </section>
+</main>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<dialog id="confirmDlg"><form method="dialog">
+  <h2 id="confirmTitle"></h2><p id="confirmText"></p>
+  <div class="buttons"><button class="btn" value="no">Cancel</button>
+    <button class="btn danger-solid" value="yes" id="confirmOk"></button></div>
+</form></dialog>
+
+<dialog id="totpDlg"><form id="totpForm">
+  <h2>Turn on two-step sign-in</h2>
   <p>Add this key to an authenticator app, then enter the 6-digit code it shows.</p>
-  <p><code id="totpSecret"></code></p>
-  <p class="muted" id="totpUri" style="overflow-wrap:anywhere"></p>
-  <input id="totpCode" inputmode="numeric" maxlength="6" placeholder="123456" style="width:8rem"> <button id="totpConfirm">Confirm</button>
-</div>
+  <code id="totpSecret"></code>
+  <p class="small" id="totpUri"></p>
+  <input id="totpCode" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="123456"
+         aria-label="6-digit code" required>
+  <p class="err small" id="totpErr" role="alert"></p>
+  <div class="buttons"><button class="btn" type="button" id="totpCancel">Cancel</button>
+    <button class="btn primary" id="totpConfirm">Confirm</button></div>
+</form></dialog>
 
-<h2>Download single video</h2>
-<form id="dlForm"><input id="dlUrl" placeholder="https://www.youtube.com/watch?v=..." required><button>Download</button></form>
-<p id="dlMsg" class="muted"></p>
-
-<h2>Subscribe to playlist or channel</h2>
-<p class="muted">Polled hourly. First pull starts immediately; videos already pulled are skipped. A channel is limited to its newest 10 uploads per poll, a playlist is taken whole.</p>
-<form id="subForm"><input id="subUrl" placeholder="https://www.youtube.com/playlist?list=... or https://www.youtube.com/@channel" required><button>Subscribe</button></form>
-<p id="subMsg" class="muted"></p>
-<div id="subs"></div>
-
-<h2>Episodes</h2><div id="eps"></div>
-<h2>Recent tasks</h2><div id="tasks"></div>
+<dialog id="pwDlg"><form id="pwForm">
+  <h2>Turn off two-step sign-in</h2>
+  <p>Enter your password to confirm.</p>
+  <input id="pwInput" type="password" autocomplete="current-password" aria-label="Password" required>
+  <p class="err small" id="pwErr" role="alert"></p>
+  <div class="buttons"><button class="btn" type="button" id="pwCancel">Cancel</button>
+    <button class="btn danger-solid">Turn off</button></div>
+</form></dialog>
 
 <script nonce="__NONCE__">
-function fmtTs(s){ return s ? new Date(s).toLocaleString() : 'never'; }
+const $ = id => document.getElementById(id);
 function esc(v){ return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function fmtDur(s){ s=Math.round(s||0); const h=Math.floor(s/3600), m=Math.floor(s%3600/60); return (h?h+'h ':'')+m+'m'; }
-function fmtNext(ep){
-  if(!ep) return 'soon';
-  const ms = ep*1000 - Date.now();
-  if(ms <= 0) return 'soon';
-  const m = Math.round(ms/60000);
-  return m < 60 ? m+'m' : Math.round(m/60)+'h';
+function fmtDay(t){ return new Date(t).toLocaleDateString(undefined, {month:'short', day:'numeric'}); }
+function fmtWhen(s){ return s ? new Date(s).toLocaleString(undefined, {month:'short', day:'numeric', hour:'numeric', minute:'2-digit'}) : 'never'; }
+function fmtNext(t){
+  const m = Math.round((t*1000 - Date.now())/60000);
+  return !t || m <= 0 ? 'soon' : m < 60 ? 'in '+m+'m' : 'in '+Math.round(m/60)+'h';
 }
+function fmtSize(bytes){ const mb = bytes/1048576; return mb >= 1024 ? (mb/1024).toFixed(1)+' GB' : mb.toFixed(1)+' MB'; }
+
+let toastTimer;
+function toast(text, isError){
+  const t = $('toast');
+  t.textContent = text; t.className = isError ? 'error' : '';
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => { t.textContent = ''; }, isError ? 8000 : 3500);
+}
+
 // The session cookie travels on its own; writes also carry the session's CSRF token.
 const CSRF = document.querySelector('meta[name=csrf]').content;
 function api(method, path, body){
@@ -423,94 +542,136 @@ async function getJson(path){
   if(r.status === 401){ location.href = '/login'; throw new Error('signed out'); }
   return r.json();
 }
-function button(label, onclick){ const b = document.createElement('button'); b.textContent = label; b.onclick = onclick; return b; }
+async function errorOf(r){ try { return (await r.json()).error || 'HTTP '+r.status; } catch(e) { return 'HTTP '+r.status; } }
+
+// Re-render a list only when its content changed, so a playing episode or an
+// open description is not reset by the periodic refresh.
+const shown = {};
+function render(id, html){
+  if(shown[id] === html) return;
+  shown[id] = html;
+  $(id).innerHTML = html;
+  $(id).removeAttribute('aria-busy');
+}
+
+function ask(title, text, okLabel){
+  $('confirmTitle').textContent = title; $('confirmText').textContent = text; $('confirmOk').textContent = okLabel;
+  const dlg = $('confirmDlg');
+  dlg.returnValue = 'no';
+  dlg.showModal();
+  return new Promise(resolve => dlg.addEventListener('close', () => resolve(dlg.returnValue === 'yes'), {once: true}));
+}
+
+function el(tag, cls, text){ const e = document.createElement(tag); if(cls) e.className = cls; if(text) e.textContent = text; return e; }
 async function account(){
-  const a = await getJson('/account'), box = document.getElementById('account');
+  const a = await getJson('/account'), box = $('account');
   box.textContent = '';
-  if(!a.username){ box.textContent = 'Using the API token. '; return; }
-  box.append('Signed in as ' + a.username + '. Two-step sign-in is ' + (a.two_step ? 'on. ' : 'off. '));
-  box.append(a.two_step
-    ? button('Turn off', async () => {
-        const password = prompt('Your password, to turn two-step sign-in off:');
-        if(password === null) return;
-        const r = await api('POST', '/account/totp', {action: 'disable', password});
-        if(!r.ok) alert((await r.json()).error);
-        account();
-      })
-    : button('Turn on', async () => {
-        const r = await (await api('POST', '/account/totp', {action: 'start'})).json();
-        document.getElementById('totpSecret').textContent = r.secret;
-        document.getElementById('totpUri').textContent = r.uri;
-        document.getElementById('twostep').hidden = false;
-      }));
-  box.append(' ', button('Log out', async () => { await api('POST', '/logout'); location.href = '/login'; }));
+  if(!a.username){ box.append(el('span', 'muted', 'Using the API token')); return; }
+  box.append(el('span', '', a.username), el('span', 'pill ' + (a.two_step ? 'ok' : 'warn'), 'Two-step ' + (a.two_step ? 'on' : 'off')));
+  const toggle = el('button', 'btn ghost', a.two_step ? 'Turn off' : 'Turn on');
+  toggle.onclick = a.two_step ? () => { $('pwInput').value = ''; $('pwErr').textContent = ''; $('pwDlg').showModal(); } : startTwoStep;
+  const out = el('button', 'btn ghost', 'Log out');
+  out.onclick = async () => { await api('POST', '/logout'); location.href = '/login'; };
+  box.append(toggle, out);
 }
-document.getElementById('totpConfirm').onclick = async () => {
-  const r = await api('POST', '/account/totp', {action: 'confirm', code: document.getElementById('totpCode').value});
-  if(!r.ok){ alert((await r.json()).error); return; }
-  document.getElementById('twostep').hidden = true;
-  account();
+async function startTwoStep(){
+  const r = await api('POST', '/account/totp', {action: 'start'});
+  if(!r.ok){ toast(await errorOf(r), true); return; }
+  const data = await r.json();
+  $('totpSecret').textContent = data.secret; $('totpUri').textContent = data.uri;
+  $('totpCode').value = ''; $('totpErr').textContent = '';
+  $('totpDlg').showModal();
+}
+$('totpCancel').onclick = () => $('totpDlg').close();
+$('pwCancel').onclick = () => $('pwDlg').close();
+$('totpForm').onsubmit = async e => {
+  e.preventDefault();
+  const r = await api('POST', '/account/totp', {action: 'confirm', code: $('totpCode').value});
+  if(!r.ok){ $('totpErr').textContent = await errorOf(r); return; }
+  $('totpDlg').close(); toast('Two-step sign-in is on'); account();
 };
+$('pwForm').onsubmit = async e => {
+  e.preventDefault();
+  const r = await api('POST', '/account/totp', {action: 'disable', password: $('pwInput').value});
+  if(!r.ok){ $('pwErr').textContent = await errorOf(r); return; }
+  $('pwDlg').close(); toast('Two-step sign-in is off'); account();
+};
+
 async function refresh(){
-  const feeds = await getJson('/feeds');
-  document.getElementById('feeds').innerHTML = feeds.length ? ' - per channel: ' + feeds.map(f =>
-    `<a href="${esc(f.url)}">${esc(f.title)}</a> (${f.episodes})`).join(', ') : '';
-  const eps = await getJson('/episodes');
-  document.getElementById('eps').innerHTML = eps.map(e =>
-    `<div class="ep">${e.thumbnail ? `<img src="${esc(e.thumbnail)}" alt="" loading="lazy">` : ''}
-     <div style="flex:1;min-width:0"><b>${esc(e.title)}</b><br>
-     <span class="muted">${esc(e.uploader)}${e.upload_date ? ' - uploaded '+esc(e.upload_date) : ''} - ${fmtDur(e.duration)} - ${(e.size/1048576).toFixed(1)} MB - added ${new Date(e.added*1000).toLocaleString()}${e.chapters.length ? ' - '+e.chapters.length+' chapters' : ''}${e.webpage_url ? ` - <a href="${esc(e.webpage_url)}" target="_blank" rel="noopener">source</a>` : ''}</span>
-     ${e.description ? `<details><summary class="muted">Description</summary><pre>${esc(e.description)}</pre></details>` : ''}
-     <audio controls preload="none" src="/audio/${encodeURIComponent(e.filename)}"></audio></div>
-     <div><button class="danger" data-del-episode="${esc(e.video_id)}" data-title="${esc(e.title)}">Delete</button></div></div>`).join('') || '<p class="muted">no episodes yet</p>';
+  const [feeds, eps, subs, tasks] = await Promise.all(['/feeds', '/episodes', '/subscriptions', '/tasks'].map(getJson));
+  render('feeds', feeds.length ? 'Per channel: ' + feeds.map(f =>
+    `<a href="${esc(f.url)}">${esc(f.title)}</a> (${f.episodes})`).join(', ') : '');
 
-  const subs = await getJson('/subscriptions');
-  document.getElementById('subs').innerHTML = subs.map(s => {
-    const last = s.last_result ? (s.last_result.ok ? `+${s.last_result.new||0} new` : `error: ${s.last_result.error}`) : '-';
-    return `<div class="sub row">
-      <div style="flex:1">
-        <div><a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.url)}</a></div>
-        <div class="muted">${s.max_items ? 'newest '+s.max_items+' per poll' : 'all items'} - added ${fmtTs(s.added)} - last poll ${fmtTs(s.last_poll)} (${esc(last)}) - next in ${fmtNext(s.next_poll)}</div>
+  $('epCount').textContent = eps.length ? eps.length + (eps.length === 1 ? ' episode, ' : ' episodes, ') + fmtSize(eps.reduce((n, e) => n + e.size, 0)) : '';
+  render('eps', eps.map(e => `<li class="row ep">
+    ${e.thumbnail ? `<img class="cover" src="${esc(e.thumbnail)}" alt="" loading="lazy" width="72" height="72">` : '<div class="cover"></div>'}
+    <div class="grow">
+      <h3 class="title">${esc(e.title)}</h3>
+      <div class="meta"><span>${esc(e.uploader || 'Unknown channel')}</span><span>${fmtDur(e.duration)}</span><span>${fmtSize(e.size)}</span>
+        <span>added ${fmtDay(e.added*1000)}</span>${e.chapters.length ? `<span>${e.chapters.length} chapters</span>` : ''}</div>
+      <audio controls preload="none" src="/audio/${encodeURIComponent(e.filename)}"></audio>
+      ${e.description ? `<details><summary>Description</summary><pre>${esc(e.description)}</pre></details>` : ''}
+    </div>
+    <div class="actions">
+      ${e.webpage_url ? `<a class="btn ghost" href="${esc(e.webpage_url)}" target="_blank" rel="noopener">YouTube</a>` : ''}
+      <button class="btn ghost danger" data-del-episode="${esc(e.video_id)}" data-title="${esc(e.title)}">Delete</button>
+    </div></li>`).join('') || '<li class="empty">No episodes yet. Paste a YouTube address above.</li>');
+
+  render('subs', subs.map(s => {
+    const r = s.last_result;
+    const last = !r ? '<span>first check pending</span>'
+      : r.ok ? `<span>last check ${fmtWhen(s.last_poll)}: ${r.new || 0} new</span>`
+      : `<span class="pill error">failed</span><span>${esc(r.error).slice(0, 200)}</span>`;
+    return `<li class="row"><div class="grow">
+        <a class="title" href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.url.split('//').pop().replace('www.', ''))}</a>
+        <div class="meta"><span>${s.max_items ? 'newest '+s.max_items+' per check' : 'whole list'}</span>${last}<span>next ${fmtNext(s.next_poll)}</span></div>
       </div>
-      <button class="danger" data-del-sub="${esc(s.id)}">Unsubscribe</button>
-    </div>`;
-  }).join('') || '<p class="muted">no subscriptions</p>';
+      <div class="actions"><button class="btn ghost danger" data-del-sub="${esc(s.id)}" data-title="${esc(s.url)}">Unsubscribe</button></div></li>`;
+  }).join('') || '<li class="empty">No subscriptions.</li>');
 
-  const ts = await getJson('/tasks');
-  document.getElementById('tasks').innerHTML = ts.slice(-25).reverse().map(t =>
-    `<div class="muted">[${esc(t.status)}] (${esc(t.type)}) ${esc(t.url)} ${t.error?'- '+esc(t.error):''} ${t.downloaded&&t.downloaded.length?'- pulled '+t.downloaded.length:''}</div>`).join('') || '<p class="muted">no tasks</p>';
+  $('activity').hidden = !tasks.length;
+  render('tasks', tasks.slice(-8).reverse().map(t => `<li class="row task">
+    <span class="pill ${esc(t.status)}">${esc(t.status)}</span>
+    <div class="grow small"><span class="url">${esc(t.filename || t.url)}</span>
+      ${t.downloaded && t.downloaded.length ? `<span class="muted"> - ${t.downloaded.length} new</span>` : ''}
+      ${t.error ? `<div class="muted">${esc(t.error).slice(0, 300)}</div>` : ''}</div></li>`).join(''));
 }
+async function tick(){
+  try { await refresh(); }
+  catch(e) { if(e.message !== 'signed out') toast('Cannot reach the server', true); }
+}
+
 // Ids travel in data attributes, never inside inline handlers.
 document.addEventListener('click', async e => {
   const d = e.target.dataset || {};
+  let r;
   if(d.delSub){
-    if(!confirm('Unsubscribe?')) return;
-    await api('DELETE', '/subscriptions/' + encodeURIComponent(d.delSub));
+    if(!await ask('Unsubscribe?', d.title, 'Unsubscribe')) return;
+    r = await api('DELETE', '/subscriptions/' + encodeURIComponent(d.delSub));
   } else if(d.delEpisode){
-    if(!confirm('Delete "' + d.title + '" from the server?')) return;
-    await api('DELETE', '/episodes/' + encodeURIComponent(d.delEpisode));
+    if(!await ask('Delete this episode?', d.title, 'Delete')) return;
+    r = await api('DELETE', '/episodes/' + encodeURIComponent(d.delEpisode));
   } else return;
-  refresh();
+  if(r.ok) toast('Removed'); else toast(await errorOf(r), true);
+  tick();
 });
-document.getElementById('dlForm').onsubmit = async e => {
+$('addForm').onsubmit = async e => {
   e.preventDefault();
-  const u = document.getElementById('dlUrl').value;
-  const r = await api('POST', '/download', {url:u});
-  document.getElementById('dlMsg').textContent = r.ok ? 'queued' : 'error: ' + ((await r.json()).error || r.status);
-  document.getElementById('dlUrl').value='';
-  refresh();
+  const subscribe = e.submitter && e.submitter.value === 'subscription';
+  const r = await api('POST', subscribe ? '/subscriptions' : '/download', {url: $('addUrl').value.trim()});
+  if(r.ok){ $('addUrl').value = ''; toast(subscribe ? 'Subscribed - first check is starting' : 'Queued'); }
+  else toast(await errorOf(r), true);
+  tick();
 };
-document.getElementById('subForm').onsubmit = async e => {
-  e.preventDefault();
-  const u = document.getElementById('subUrl').value;
-  const r = await api('POST', '/subscriptions', {url:u});
-  document.getElementById('subMsg').textContent = r.ok ? 'subscribed; first poll starting' : 'error: ' + ((await r.json()).error || r.status);
-  document.getElementById('subUrl').value='';
-  refresh();
+$('feedUrl').textContent = location.origin + '/feed';
+$('copyFeed').onclick = async () => {
+  try { await navigator.clipboard.writeText(location.origin + '/feed'); toast('Feed address copied'); }
+  catch(e) { toast('Could not copy - select the address instead', true); }
 };
-account(); refresh(); setInterval(refresh, 5000);
+account(); tick(); setInterval(tick, 5000);
 </script>
-"""
+</html>
+""".replace("__THEME__", _THEME_CSS)
 
 
 def _is_public(path: str) -> bool:
@@ -565,7 +726,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header(
             "Content-Security-Policy",
-            f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; img-src 'self'; "
+            f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; img-src 'self'; "
             "media-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
         )
         for name, value in extra_headers:

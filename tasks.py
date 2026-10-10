@@ -27,7 +27,7 @@ import tempfile
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from queue import Queue
 from urllib.parse import urlsplit
 
@@ -92,7 +92,7 @@ _INFO_KEYS = (
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+    return datetime.now(UTC).replace(tzinfo=None).isoformat() + "Z"
 
 
 def is_valid_url(url: str) -> bool:
