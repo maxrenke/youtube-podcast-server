@@ -470,7 +470,8 @@ border-radius:var(--radius-sm);padding:8px 16px;max-width:calc(100vw - 32px)}
       <button class="btn primary" name="kind" value="video">Add video</button>
       <button class="btn" name="kind" value="subscription">Subscribe</button>
     </form>
-    <p class="muted small feed">Subscriptions are checked every hour: a channel's newest 10 uploads, a playlist whole.</p>
+    <p class="muted small feed">Subscribing to a channel follows its Videos tab - no Shorts or live streams - whichever
+      channel address you paste. Checked every hour: a channel's newest 10 videos, a playlist whole.</p>
     <div class="feed small"><span class="muted">Feed</span><code id="feedUrl"></code>
       <button class="btn ghost" id="copyFeed" type="button">Copy</button><span id="feeds" class="muted"></span></div>
   </section>
@@ -659,7 +660,10 @@ $('addForm').onsubmit = async e => {
   e.preventDefault();
   const subscribe = e.submitter && e.submitter.value === 'subscription';
   const r = await api('POST', subscribe ? '/subscriptions' : '/download', {url: $('addUrl').value.trim()});
-  if(r.ok){ $('addUrl').value = ''; toast(subscribe ? 'Subscribed - first check is starting' : 'Queued'); }
+  if(r.ok){
+    $('addUrl').value = '';
+    toast(subscribe ? 'Subscribed to ' + (await r.json()).url.split('//').pop().replace('www.', '') : 'Queued');
+  }
   else toast(await errorOf(r), true);
   tick();
 };

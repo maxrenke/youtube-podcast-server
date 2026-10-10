@@ -210,12 +210,17 @@ curl -X POST http://localhost:5757/subscriptions \
   -d '{"url": "https://www.youtube.com/playlist?list=PLAYLIST_ID"}'
 ```
 
-Supports any URL that yt-dlp accepts as a multi-video source:
+A channel address in any form is stored as that channel's **Videos tab**, so a
+subscription follows uploads only - no Shorts, no live streams. The response
+shows the address that was stored. Subscribing to something already
+subscribed returns the existing entry instead of adding a second one.
+
+Accepted:
 
 - Playlist URL: `https://www.youtube.com/playlist?list=PLAYLIST_ID`
-- Channel handle: `https://www.youtube.com/@CHANNEL_HANDLE`
-- Channel URL: `https://www.youtube.com/channel/CHANNEL_ID`
-- "Uploads" tab: `https://www.youtube.com/@CHANNEL_HANDLE/videos`
+- Channel, any form: `https://www.youtube.com/@CHANNEL_HANDLE`,
+  `.../channel/CHANNEL_ID`, `.../c/NAME`, `.../user/NAME`, with or without a
+  tab such as `/featured`, `/streams` or `/shorts` - all become `.../videos`
 
 Optional body fields:
 

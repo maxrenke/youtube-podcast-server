@@ -393,12 +393,87 @@ def test_delete_episode_removes_all_three_files(base_url):
 
 # --- subscriptions, retention, staging, queue persistence -------------------------
 
+@pytest.mark.parametrize("given", [
+    "https://www.youtube.com/@FlintDibble",
+    "https://www.youtube.com/@FlintDibble/",
+    "https://youtube.com/@FlintDibble/featured",
+    "https://www.youtube.com/@FlintDibble/streams",
+    "https://www.youtube.com/@FlintDibble/shorts",
+    "https://m.youtube.com/@FlintDibble/videos?view=0",
+])
+def test_any_channel_address_becomes_its_videos_tab(given):
+    assert tasks.normalize_subscription_url(given) == "https://www.youtube.com/@FlintDibble/videos"
+
+
+@pytest.mark.parametrize("given, expected", [
+    ("https://www.youtube.com/channel/UC27vDmUZpQjuJFFkUz8ujtg", "https://www.youtube.com/channel/UC27vDmUZpQjuJFFkUz8ujtg/videos"),
+    ("https://www.youtube.com/c/SomeName/live", "https://www.youtube.com/c/SomeName/videos"),
+    ("https://www.youtube.com/user/SomeName", "https://www.youtube.com/user/SomeName/videos"),
+    # not channels: left exactly as given
+    ("https://www.youtube.com/playlist?list=PL123", "https://www.youtube.com/playlist?list=PL123"),
+    ("https://www.youtube.com/watch?v=abc&list=PL123", "https://www.youtube.com/watch?v=abc&list=PL123"),
+    ("https://youtu.be/abc", "https://youtu.be/abc"),
+    ("https://example.com/@FlintDibble", "https://example.com/@FlintDibble"),
+])
+def test_other_addresses(given, expected):
+    assert tasks.normalize_subscription_url(given) == expected
+
+
+def test_subscribing_stores_the_videos_tab_and_does_not_duplicate(base_url):
+    status, _, body = _request(f"{base_url}/subscriptions", "POST", {"url": "https://www.youtube.com/@FlintDibble"}, AUTH)
+    first = json.loads(body)
+    try:
+        assert (status, first["url"], first["max_items"]) == (201, "https://www.youtube.com/@FlintDibble/videos", 10)
+        again = json.loads(_request(f"{base_url}/subscriptions", "POST",
+                                    {"url": "https://www.youtube.com/@FlintDibble/streams"}, AUTH)[2])
+        assert again["id"] == first["id"]
+        assert len(tasks.list_subscriptions()) == 1
+    finally:
+        tasks.remove_subscription(first["id"])
+
+
+def test_saved_channel_subscriptions_are_repointed_on_start(monkeypatch):
+    stale = os.path.join(tasks.INCOMING_DIR, "sub-old1")
+    os.makedirs(stale, exist_ok=True)
+    saved = [
+        {"id": "old1", "url": "https://www.youtube.com/@FlintDibble", "interval_seconds": 3600, "max_items": 10, "next_poll": 9e9},
+        {"id": "ok1", "url": "https://www.youtube.com/playlist?list=PL1", "interval_seconds": 3600, "max_items": 0, "next_poll": 9e9},
+    ]
+    with open(tasks.SUBSCRIPTIONS_FILE, "w", encoding="utf-8") as f:
+        json.dump(saved, f)
+    with open(tasks.TASKS_FILE, "w", encoding="utf-8") as f:
+        json.dump([
+            {"id": "t1", "type": "subscription", "subscription_id": "old1", "url": "https://www.youtube.com/@FlintDibble",
+             "max_items": 10, "status": "downloading"},
+            {"id": "t2", "type": "subscription", "subscription_id": "gone", "url": "https://www.youtube.com/@Gone", "status": "queued"},
+        ], f)
+    monkeypatch.setattr(tasks, "SUBSCRIPTIONS", {})
+    monkeypatch.setattr(tasks, "TASKS", {})
+    monkeypatch.setattr(tasks, "SUB_QUEUE", tasks.Queue())  # no worker drains this one
+    try:
+        tasks._load_subscriptions()
+        tasks._load_tasks()
+        assert tasks.SUBSCRIPTIONS["old1"]["url"] == "https://www.youtube.com/@FlintDibble/videos"
+        assert tasks.SUBSCRIPTIONS["old1"]["next_poll"] == 0.0  # poll again straight away
+        assert tasks.SUBSCRIPTIONS["ok1"]["next_poll"] == 9e9
+        assert not os.path.exists(stale)  # what the old address left in staging is gone
+        with open(tasks.SUBSCRIPTIONS_FILE, encoding="utf-8") as f:
+            assert json.load(f)[0]["url"].endswith("/videos")
+        # the interrupted poll follows the fixed address; the poll of a removed subscription is dropped
+        assert list(tasks.TASKS) == ["t1"]
+        assert tasks.TASKS["t1"]["url"] == "https://www.youtube.com/@FlintDibble/videos"
+    finally:
+        os.remove(tasks.SUBSCRIPTIONS_FILE)
+        os.remove(tasks.TASKS_FILE)
+
+
 def test_subscription_defaults_bound_channels_but_not_playlists():
     channel = tasks.add_subscription("https://www.youtube.com/@SomeChannel")
     playlist = tasks.add_subscription("https://www.youtube.com/playlist?list=PL123")
     explicit = tasks.add_subscription("https://www.youtube.com/@Other", max_items=3)
     try:
         assert (channel["max_items"], playlist["max_items"], explicit["max_items"]) == (10, 0, 3)
+        assert channel["url"] == "https://www.youtube.com/@SomeChannel/videos"
     finally:
         for sub in (channel, playlist, explicit):
             tasks.remove_subscription(sub["id"])

@@ -113,6 +113,28 @@ def is_valid_url(url: str) -> bool:
     return any(host == allowed or host.endswith("." + allowed) for allowed in ALLOWED_HOSTS)
 
 
+_CHANNEL_PATH = re.compile(r"^/(@[^/]+|channel/[^/]+|c/[^/]+|user/[^/]+)(?:/[^/]*)?/?$")
+
+
+def normalize_subscription_url(url: str) -> str:
+    """A YouTube channel address in any form becomes that channel's Videos tab.
+
+    Given the bare channel address, yt-dlp walks the Videos, Live and Shorts
+    tabs. A subscription follows uploads only, so every channel address
+    (bare, /featured, /streams, /shorts, ...) is pointed at /videos. Playlists
+    and anything that is not a channel are returned unchanged.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    host = (parts.hostname or "").lower()
+    match = _CHANNEL_PATH.match(parts.path)
+    if not match or "list=" in parts.query or not (host == "youtube.com" or host.endswith(".youtube.com")):
+        return url
+    return f"https://www.youtube.com/{match.group(1)}/videos"
+
+
 def _ensure_dirs() -> None:
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     os.makedirs(INCOMING_DIR, exist_ok=True)
@@ -156,6 +178,12 @@ def _load_tasks() -> None:
     except (OSError, json.JSONDecodeError):
         return
     for task in pending:
+        if task["type"] == TYPE_SUBSCRIPTION:
+            # The subscription may have been removed or re-pointed since the poll was queued.
+            sub = SUBSCRIPTIONS.get(task.get("subscription_id", ""))
+            if not sub:
+                continue
+            task["url"], task["max_items"] = sub["url"], sub.get("max_items", 0)
         task["status"] = STATUS_QUEUED
         with TASKS_LOCK:
             TASKS[task["id"]] = task
@@ -217,12 +245,24 @@ def _load_subscriptions() -> None:
     try:
         with open(SUBSCRIPTIONS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
+        repointed = False
         with SUBS_LOCK:
             SUBSCRIPTIONS.clear()
             for sub in data:
+                videos_url = normalize_subscription_url(sub["url"])
+                if videos_url != sub["url"]:
+                    # Saved before channel addresses were pointed at the Videos tab:
+                    # fix it, drop what the old address left in staging, poll again now.
+                    print(f"[subs] {sub['url']} -> {videos_url}", flush=True)
+                    sub["url"], sub["next_poll"] = videos_url, 0.0
+                    shutil.rmtree(os.path.join(INCOMING_DIR, "sub-" + sub["id"]), ignore_errors=True)
+                    repointed = True
                 SUBSCRIPTIONS[sub["id"]] = sub
     except (OSError, json.JSONDecodeError) as e:
         print(f"[subs] failed to load {SUBSCRIPTIONS_FILE}: {e}", flush=True)
+        return
+    if repointed:
+        _save_subscriptions()
 
 
 def _save_subscriptions() -> None:
@@ -251,11 +291,20 @@ def add_subscription(
     The first poll is scheduled immediately (``next_poll`` = now). The
     background scheduler will pick it up within ``SCHEDULER_TICK_SECONDS``.
 
+    A channel address is stored as that channel's Videos tab (see
+    ``normalize_subscription_url``), so Shorts and live streams are left out.
+    Subscribing to something already subscribed returns the existing entry.
+
     ``max_items`` is how many entries from the top of the list each poll looks
     at (0 = all). Channels list newest first, so the default keeps a new
     subscription from pulling the whole back catalogue. Playlists are finite
     and usually grow at the end, so they default to all.
     """
+    url = normalize_subscription_url(url)
+    with SUBS_LOCK:
+        existing = next((dict(s) for s in SUBSCRIPTIONS.values() if s["url"] == url), None)
+    if existing:
+        return existing  # already subscribed: nothing to add
     if max_items is None:
         max_items = 0 if "list=" in url else SUB_MAX_ITEMS
     sub = {
@@ -444,6 +493,7 @@ def _ytdlp_common_args(workdir: str) -> list[str]:
         "--parse-metadata", f"%(xx|{album})s:%(meta_album)s",
         "--parse-metadata", "%(xx|Podcast)s:%(meta_genre)s",
         "--write-info-json",
+        "--no-write-playlist-metafiles",  # no info.json/cover for the playlist or channel itself
         "-o", os.path.join(workdir, "%(title)s [%(id)s].%(ext)s"),
         "--print", "after_move:filepath",
     ]
