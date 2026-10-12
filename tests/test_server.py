@@ -518,6 +518,48 @@ def test_publish_trims_info_and_stale_audio_is_cleared():
                     "chapters": [{"start_time": 1.5, "title": "c"}]}
 
 
+def test_a_run_keeps_its_command_and_live_output(base_url):
+    workdir = os.path.join(tasks.INCOMING_DIR, "run-test")
+    os.makedirs(workdir, exist_ok=True)
+    # stands in for yt-dlp: progress lines, one finished episode, one failed item, non-zero exit
+    script = (
+        "import os, sys\n"
+        "print('[download]  50.0% of 10.00MiB at 1.00MiB/s ETA 00:05')\n"
+        "path = os.path.join(sys.argv[1], 'T [vid00000042].mp3')\n"
+        "open(path, 'wb').write(b'audio')\n"
+        "print('[ExtractAudio] Destination: ' + path)\n"
+        "print(path)\n"
+        "print('ERROR: [youtube] abc: Video unavailable')\n"
+        "sys.exit(1)\n"
+    )
+    task = {"id": "run1", "type": "video", "url": "https://youtu.be/abc", "status": "downloading"}
+    tasks.TASKS["run1"] = task
+    try:
+        paths, error = tasks._run_ytdlp([sys.executable, "-u", "-c", script, workdir], task, 30, workdir)
+        assert [os.path.basename(p) for p in paths] == ["T [vid00000042].mp3"]
+        assert os.path.exists(os.path.join(tasks.DOWNLOAD_DIR, "T [vid00000042].mp3"))  # published as soon as it was printed
+        assert error == "ERROR: [youtube] abc: Video unavailable"
+        assert task["progress"] == "ERROR: [youtube] abc: Video unavailable"
+
+        assert _request(f"{base_url}/tasks/run1/log")[0] == 401
+        status, _, body = _request(f"{base_url}/tasks/run1/log", headers=AUTH)
+        log = json.loads(body)
+        assert status == 200 and " -u -c " in log["command"] and "run-test" in log["command"]
+        assert log["lines"] == [
+            "[download]  50.0% of 10.00MiB at 1.00MiB/s ETA 00:05",
+            "[ExtractAudio] Destination: " + os.path.join(workdir, "T [vid00000042].mp3"),
+            "published T [vid00000042].mp3",
+            "ERROR: [youtube] abc: Video unavailable",
+        ]
+        assert log["progress_age"] >= 0 and "converting" not in log
+        listed = next(t for t in json.loads(_request(f"{base_url}/tasks", headers=AUTH)[2]) if t["id"] == "run1")
+        assert "lines" not in listed and listed["command"] == log["command"]
+        assert _request(f"{base_url}/tasks/nope/log", headers=AUTH)[0] == 404
+    finally:
+        tasks.TASKS.pop("run1", None)
+        tasks.TASK_LOGS.pop("run1", None)
+
+
 def test_pending_tasks_survive_a_restart(monkeypatch):
     monkeypatch.setattr(tasks, "TASKS", {})
     monkeypatch.setattr(tasks, "VIDEO_QUEUE", tasks.Queue())  # no worker drains this one

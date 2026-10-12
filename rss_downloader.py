@@ -21,6 +21,7 @@ from tasks import (
     enqueue_download,
     get_subscription,
     get_task,
+    get_task_log,
     is_valid_url,
     list_subscriptions,
     list_tasks,
@@ -453,6 +454,14 @@ dialog .buttons{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
 border-radius:var(--radius-sm);padding:8px 16px;max-width:calc(100vw - 32px)}
 #toast.error{border-color:var(--danger);color:var(--danger)}
 #toast:empty{display:none}
+.step{color:var(--muted);margin-top:4px;overflow-wrap:anywhere}
+progress{display:block;width:100%;height:6px;margin-top:8px;accent-color:var(--accent)}
+dialog.wide{width:min(860px,calc(100vw - 32px))}
+dialog h3{font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:16px 0 8px}
+dialog pre{font:12px/1.5 ui-monospace,Consolas,monospace;color:var(--text);background:var(--bg);border:1px solid var(--border);
+border-radius:var(--radius-sm);padding:12px;margin:0;white-space:pre-wrap;overflow-wrap:anywhere;overflow:auto}
+#logCmd{max-height:20vh}
+#logOut{height:36vh}
 @media (max-width:560px){.add input{flex-basis:100%}.add .btn{flex:1}.cover{width:56px;height:56px}.actions{flex-direction:row}.row.ep{flex-wrap:wrap}
 .row.ep .actions{width:100%;justify-content:flex-end}}
 @media (prefers-reduced-motion:no-preference){.btn,input{transition:border-color .12s,background-color .12s,color .12s}}
@@ -512,6 +521,15 @@ border-radius:var(--radius-sm);padding:8px 16px;max-width:calc(100vw - 32px)}
   <p class="err small" id="pwErr" role="alert"></p>
   <div class="buttons"><button class="btn" type="button" id="pwCancel">Cancel</button>
     <button class="btn danger-solid">Turn off</button></div>
+</form></dialog>
+
+<dialog id="logDlg" class="wide" aria-labelledby="logTitle"><form method="dialog">
+  <h2 id="logTitle">Task details</h2>
+  <p class="small"><span class="pill" id="logStatus"></span> <span id="logWhat"></span></p>
+  <h3>Command</h3><pre id="logCmd" tabindex="0"></pre>
+  <h3>Output <span id="logAge"></span></h3><pre id="logOut" tabindex="0"></pre>
+  <div class="buttons"><button class="btn" type="button" id="logCopy">Copy command</button>
+    <button class="btn primary" value="close">Close</button></div>
 </form></dialog>
 
 <script nonce="__NONCE__">
@@ -630,13 +648,70 @@ async function refresh(){
       <div class="actions"><button class="btn ghost danger" data-del-sub="${esc(s.id)}" data-title="${esc(s.url)}">Unsubscribe</button></div></li>`;
   }).join('') || '<li class="empty">No subscriptions.</li>');
 
+  renderTasks(tasks);
+}
+
+// yt-dlp's own progress line, e.g. "[download]  42.3% of 95.70MiB at 3.21MiB/s ETA 00:12"
+function percentOf(line){ const m = /([0-9]+(?:[.][0-9]+)?)% of/.exec(line || ''); return m ? parseFloat(m[1]) : null; }
+function fmtAge(s){ return s < 60 ? s + 's' : Math.floor(s/60) + 'm ' + String(s%60).padStart(2, '0') + 's'; }
+let anyActive = false;
+function renderTasks(tasks){
+  const recent = tasks.slice(-8).reverse();
+  anyActive = tasks.some(t => t.status === 'downloading' || t.status === 'queued');
   $('activity').hidden = !tasks.length;
-  render('tasks', tasks.slice(-8).reverse().map(t => `<li class="row task">
+  // The rows are rebuilt only when a task appears or changes state; the lines
+  // that change every second are filled in below, so a button is never
+  // replaced under the pointer.
+  render('tasks', recent.map(t => `<li class="row task">
     <span class="pill ${esc(t.status)}">${esc(t.status)}</span>
     <div class="grow small"><span class="url">${esc(t.filename || t.url)}</span>
       ${t.downloaded && t.downloaded.length ? `<span class="muted"> - ${t.downloaded.length} new</span>` : ''}
-      ${t.error ? `<div class="muted">${esc(t.error).slice(0, 300)}</div>` : ''}</div></li>`).join(''));
+      ${t.status === 'downloading' ? `<div class="step" id="step-${esc(t.id)}"></div><progress id="bar-${esc(t.id)}" max="100" value="0" hidden></progress>` : ''}
+      ${t.error ? `<div class="muted">${esc(t.error).slice(0, 300)}</div>` : ''}</div>
+    <div class="actions">${t.command ? `<button class="btn ghost" data-task-log="${esc(t.id)}">Details</button>` : ''}</div></li>`).join(''));
+  for(const t of recent){
+    const step = $('step-' + t.id), bar = $('bar-' + t.id);
+    if(!step) continue;
+    // a step that prints nothing while it works (converting to mp3) shows how long it has been going
+    step.textContent = (t.progress || '')
+      + (t.converted_bytes ? ' - ' + fmtSize(t.converted_bytes) + ' written' : '')
+      + (t.progress_age >= 5 ? ' (' + fmtAge(t.progress_age) + ')' : '');
+    const pct = percentOf(t.progress);
+    bar.hidden = pct === null;
+    if(pct !== null) bar.value = pct;
+  }
 }
+
+// Task details: the exact command and what it has printed, refreshed while the dialog is open.
+let logTimer;
+async function loadLog(id){
+  const r = await fetch('/tasks/' + encodeURIComponent(id) + '/log');
+  if(r.status === 401){ location.href = '/login'; return; }
+  if(!r.ok){ $('logOut').textContent = 'This task is no longer kept by the server (it restarted).'; clearInterval(logTimer); return; }
+  const t = await r.json(), out = $('logOut');
+  $('logStatus').textContent = t.status; $('logStatus').className = 'pill ' + t.status;
+  $('logWhat').textContent = (t.type === 'subscription' ? 'Subscription check: ' : 'Video: ') + t.url;
+  $('logCmd').textContent = t.command || '(not started yet)';
+  $('logAge').textContent = t.status === 'downloading' && t.progress_age >= 5
+    ? '- last line ' + fmtAge(t.progress_age) + ' ago' + (t.converted_bytes ? ', ' + fmtSize(t.converted_bytes) + ' of mp3 written' : '') : '';
+  const atEnd = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
+  const text = t.lines.join(String.fromCharCode(10)) || '(no output yet)';
+  if(out.textContent !== text){ out.textContent = text; if(atEnd) out.scrollTop = out.scrollHeight; }
+  if(t.status !== 'downloading' && t.status !== 'queued') clearInterval(logTimer);
+}
+function openLog(id){
+  $('logOut').textContent = 'Loading...'; $('logCmd').textContent = ''; $('logAge').textContent = '';
+  $('logDlg').showModal();
+  $('logOut').scrollTop = 0;
+  clearInterval(logTimer);
+  loadLog(id).then(() => { $('logOut').scrollTop = $('logOut').scrollHeight; });
+  logTimer = setInterval(() => loadLog(id), 1500);
+}
+$('logDlg').addEventListener('close', () => clearInterval(logTimer));
+$('logCopy').onclick = async () => {
+  try { await navigator.clipboard.writeText($('logCmd').textContent); toast('Command copied'); }
+  catch(e) { toast('Could not copy - select the text instead', true); }
+};
 async function tick(){
   try { await refresh(); }
   catch(e) { if(e.message !== 'signed out') toast('Cannot reach the server', true); }
@@ -645,6 +720,7 @@ async function tick(){
 // Ids travel in data attributes, never inside inline handlers.
 document.addEventListener('click', async e => {
   const d = e.target.dataset || {};
+  if(d.taskLog){ openLog(d.taskLog); return; }
   let r;
   if(d.delSub){
     if(!await ask('Unsubscribe?', d.title, 'Unsubscribe')) return;
@@ -673,6 +749,8 @@ $('copyFeed').onclick = async () => {
   catch(e) { toast('Could not copy - select the address instead', true); }
 };
 account(); tick(); setInterval(tick, 5000);
+// while something is downloading, keep its progress line current between full refreshes
+setInterval(async () => { if(anyActive){ try { renderTasks(await getJson('/tasks')); } catch(e) {} } }, 2000);
 </script>
 </html>
 """.replace("__THEME__", _THEME_CSS)
@@ -933,6 +1011,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, list_episodes())
         elif path == "/tasks":
             self._json(200, list_tasks())
+        elif path.startswith("/tasks/") and path.endswith("/log"):
+            log = get_task_log(path[len("/tasks/"):-len("/log")])
+            if log is None:
+                self._json(404, {"error": "not found"})
+            else:
+                self._json(200, log)
         elif path.startswith("/tasks/"):
             t = get_task(path[len("/tasks/"):])
             if not t:

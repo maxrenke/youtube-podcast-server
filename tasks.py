@@ -21,12 +21,13 @@ applies the retention limits (``KEEP_DAYS`` / ``KEEP_COUNT``).
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
-import tempfile
 import threading
 import time
 import uuid
+from collections import deque
 from datetime import UTC, datetime
 from queue import Queue
 from urllib.parse import urlsplit
@@ -70,6 +71,10 @@ VIDEO_QUEUE: "Queue[dict]" = Queue()
 SUB_QUEUE: "Queue[dict]" = Queue()
 TASKS: dict[str, dict] = {}
 TASKS_LOCK = threading.Lock()
+# What yt-dlp printed for each task, newest LOG_LINES lines. Kept apart from the
+# task itself so the task list stays small; the admin page fetches it on demand.
+TASK_LOGS: dict[str, deque] = {}
+LOG_LINES = 400
 
 SUBSCRIPTIONS: dict[str, dict] = {}
 SUBS_LOCK = threading.Lock()
@@ -204,6 +209,7 @@ def _record_task(task: dict) -> None:
         finished = [t for t in TASKS.values() if t["status"] not in _PENDING]
         for old in finished[:-TASK_HISTORY]:
             del TASKS[old["id"]]
+            TASK_LOGS.pop(old["id"], None)
     _queue_for(task).put(task)
     _save_tasks()
 
@@ -224,15 +230,39 @@ def enqueue_download(url: str) -> str:
     return str(task["id"])
 
 
+def _view(task: dict) -> dict:
+    """A copy of the task for the API, with how long its current step has been running."""
+    view = dict(task)
+    converting = view.pop("converting", None)
+    if view["status"] == STATUS_DOWNLOADING and view.get("progress_at"):
+        view["progress_age"] = max(0, int(time.time() - view["progress_at"]))
+        # ffmpeg prints nothing while it converts; the growing mp3 is the progress.
+        if converting:
+            try:
+                view["converted_bytes"] = os.path.getsize(converting)
+            except OSError:
+                pass
+    return view
+
+
 def get_task(task_id: str) -> dict | None:
     with TASKS_LOCK:
         task = TASKS.get(task_id)
-        return dict(task) if task else None
+        return _view(task) if task else None
 
 
 def list_tasks() -> list[dict]:
     with TASKS_LOCK:
-        return [dict(t) for t in TASKS.values()]
+        return [_view(t) for t in TASKS.values()]
+
+
+def get_task_log(task_id: str) -> dict | None:
+    """The command yt-dlp was started with and the lines it has printed so far."""
+    with TASKS_LOCK:
+        task = TASKS.get(task_id)
+        if not task:
+            return None
+        return {**_view(task), "lines": list(TASK_LOGS.get(task_id, ()))}
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +526,10 @@ def _ytdlp_common_args(workdir: str) -> list[str]:
         "--no-write-playlist-metafiles",  # no info.json/cover for the playlist or channel itself
         "-o", os.path.join(workdir, "%(title)s [%(id)s].%(ext)s"),
         "--print", "after_move:filepath",
+        # --print makes yt-dlp quiet; turn its normal output back on, with one
+        # progress line per update, so the admin page can show what it is doing.
+        "--no-quiet", "--progress", "--newline",
+        "--encoding", "utf-8",  # what _run_ytdlp decodes, whatever the platform's default is
     ]
 
 
@@ -513,18 +547,66 @@ def _prepare_workdir(workdir: str) -> None:
             os.remove(os.path.join(workdir, fn))
 
 
-def _ytdlp_single(url: str, workdir: str) -> str | None:
+def _run_ytdlp(cmd: list[str], task: dict, timeout: int, workdir: str = "") -> tuple[list[str], str]:
+    """Run yt-dlp, keeping its command line and live output on the task.
+
+    Every line it prints goes into the task's log, and the newest line is the
+    task's ``progress`` (with the staging folder cut out of it, to keep it
+    readable). A line that is the path of a finished mp3 is published
+    right away, so a playlist's episodes appear one by one instead of all at
+    the end. Returns the published paths and, if yt-dlp exited non-zero, its
+    error text.
+    """
+    log: deque = deque(maxlen=LOG_LINES)
+    with TASKS_LOCK:
+        TASK_LOGS[task["id"]] = log
+        task["command"] = shlex.join(cmd)
+        task["progress"], task["progress_at"] = "starting yt-dlp", time.time()
+    paths: list[str] = []
+    errors: list[str] = []
+    # stderr is merged into stdout: one stream in the order things happened, and
+    # no second pipe that could fill up and stall yt-dlp.
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace")
+    killer = threading.Timer(timeout, proc.kill)
+    killer.start()
+    try:
+        for raw in proc.stdout or []:
+            line = raw.rstrip()
+            if not line:
+                continue
+            published = _publish(line)
+            if published:
+                paths.append(published)
+                line = "published " + os.path.basename(published)
+            elif line.startswith("ERROR:"):
+                errors.append(line)
+            marker = "[ExtractAudio] Destination: "
+            with TASKS_LOCK:
+                log.append(line)
+                task["converting"] = line[len(marker):] if line.startswith(marker) else None
+                short = line.replace(workdir + os.sep, "") if workdir else line
+                task["progress"], task["progress_at"] = short[:300], time.time()
+        proc.wait()
+    finally:
+        killer.cancel()
+    error = ""
+    if proc.returncode != 0:
+        error = "\n".join(errors)[-2000:] or "\n".join(list(log)[-5:]) or "yt-dlp failed"
+    return paths, error
+
+
+def _ytdlp_single(task: dict, workdir: str) -> str | None:
     """Download one video; returns the published mp3 path or None."""
     _prepare_workdir(workdir)
-    cmd = ["yt-dlp", *_ytdlp_common_args(workdir), "--no-playlist", "--", url]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * 60, check=False)
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "yt-dlp failed")
-    out = proc.stdout.strip().splitlines()
-    return _publish(out[-1]) if out else None
+    cmd = ["yt-dlp", *_ytdlp_common_args(workdir), "--no-playlist", "--", task["url"]]
+    paths, error = _run_ytdlp(cmd, task, 60 * 60, workdir)
+    if error and not paths:
+        raise RuntimeError(error)
+    return paths[-1] if paths else None
 
 
-def _ytdlp_playlist(url: str, workdir: str, max_items: int = 0) -> list[str]:
+def _ytdlp_playlist(task: dict, workdir: str) -> list[str]:
     """Download every new item in a playlist/channel. Returns paths of newly published mp3s.
 
     Uses ``--download-archive`` so previously-downloaded video IDs are skipped.
@@ -540,31 +622,15 @@ def _ytdlp_playlist(url: str, workdir: str, max_items: int = 0) -> list[str]:
         # failing the poll every hour.
         "--match-filter", "availability!=subscriber_only",
     ]
+    max_items = int(task.get("max_items") or 0)
     if max_items > 0:
         cmd += ["--playlist-end", str(max_items)]
-    cmd += ["--", url]
-    paths: list[str] = []
-    # stderr goes to a file: a pipe nobody reads would fill up and stall yt-dlp.
-    with tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as err:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, text=True)
-        killer = threading.Timer(60 * 60 * 6, proc.kill)
-        killer.start()
-        try:
-            # yt-dlp prints each finished file; publish it right away instead of
-            # holding every episode back until the whole poll is done.
-            for line in proc.stdout or []:
-                published = _publish(line.strip())
-                if published:
-                    paths.append(published)
-            proc.wait()
-        finally:
-            killer.cancel()
-        err.seek(0)
-        stderr = err.read()
+    cmd += ["--", task["url"]]
+    paths, error = _run_ytdlp(cmd, task, 60 * 60 * 6, workdir)
     # With --ignore-errors yt-dlp may exit non-zero even with partial success;
-    # surface stderr only if nothing landed.
-    if proc.returncode != 0 and not paths:
-        raise RuntimeError(stderr.strip()[-2000:] or "yt-dlp failed")
+    # report the error only if nothing landed.
+    if error and not paths:
+        raise RuntimeError(error)
     return paths
 
 
@@ -574,7 +640,7 @@ def _ytdlp_playlist(url: str, workdir: str, max_items: int = 0) -> list[str]:
 
 def _handle_video_task(task: dict) -> None:
     workdir = os.path.join(INCOMING_DIR, task["id"])
-    final_path = _ytdlp_single(task["url"], workdir)
+    final_path = _ytdlp_single(task, workdir)
     if not final_path:
         raise RuntimeError("No mp3 produced")
     task["filename"] = os.path.basename(final_path)
@@ -585,7 +651,7 @@ def _handle_subscription_task(task: dict) -> None:
     sub_id = task["subscription_id"]
     workdir = os.path.join(INCOMING_DIR, "sub-" + sub_id)
     try:
-        paths = _ytdlp_playlist(task["url"], workdir, int(task.get("max_items") or 0))
+        paths = _ytdlp_playlist(task, workdir)
         task["downloaded"] = [os.path.basename(p) for p in paths]
         result = {"ok": True, "new": len(paths), "at": _now_iso()}
     except Exception as e:

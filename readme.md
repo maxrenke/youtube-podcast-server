@@ -274,6 +274,15 @@ single download is retried once after `RETRY_DELAY_SECONDS`; a failed poll
 runs again at the subscription's next interval. Single downloads and polls
 have separate workers, so a long poll does not hold up a single video.
 
+### `GET /tasks/<id>/log` - what a task is doing
+
+The task plus the exact yt-dlp command line it was started with (`command`)
+and the lines yt-dlp has printed so far (`lines`, newest 400). While a task
+runs, `progress` is the newest line and `progress_age` is how many seconds
+ago it was printed - the conversion to mp3 prints nothing while it works, so
+that is the only sign of life during it. The admin page shows this under
+**Details** in the Activity list.
+
 ### `GET /audio/<filename>` - download an mp3
 
 Streams the file with `Accept-Ranges: bytes` so podcast apps can do partial
