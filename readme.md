@@ -141,7 +141,7 @@ HTML page with forms for submitting URLs and managing subscriptions.
 ### `GET /rss` - podcast feed
 
 `application/rss+xml`. One `<item>` per mp3 in the top level of
-`DOWNLOAD_DIR`, newest addition first. The list is derived from the
+`DOWNLOAD_DIR`, newest first (see `<pubDate>` under Episode metadata). The list is derived from the
 filesystem on every request, so removing an mp3 makes it disappear from the
 feed (see [Removing episodes](#removing-episodes)).
 
@@ -332,7 +332,7 @@ What each RSS `<item>` carries:
 | `<link>`                | The video's URL.                                                         |
 | `<description>`         | Plain text: `Channel - uploaded YYYY-MM-DD - 1h 37m`, the video URL, then the full video description. |
 | `<content:encoded>`     | The same as HTML show notes: channel link, "Watch the original video", description with clickable links, chapter list. |
-| `<pubDate>`             | When the episode was **added** (yt-dlp's `epoch`), not the upload date, so a newly queued old video sorts to the top in the app. The upload date is in the description. |
+| `<pubDate>`             | For an episode you added by hand: when you **added** it, so an old video you just queued sorts to the top in the app. For an episode a subscription pulled: when the video was **uploaded**, so a batch lands in the channel's own order. The upload date is always in the description. |
 | `<itunes:image>`        | `/thumb/<stem>.jpg`; falls back to YouTube's thumbnail URL for files downloaded before covers were saved. |
 | `<itunes:author>`       | Channel name.                                                            |
 | `<itunes:duration>`     | Seconds.                                                                 |
@@ -490,7 +490,7 @@ How it is built (`auth.py`, standard library only):
 | Part            | Detail                                                                                   |
 |-----------------|------------------------------------------------------------------------------------------|
 | Password        | scrypt (N=2^15, r=8, p=1), random 16-byte salt, in `STATE_DIR/auth.json` (mode 600). A wrong user name costs the same time as a wrong password. |
-| Session         | Random 256-bit id in a cookie: `__Host-` prefix, `Secure`, `HttpOnly`, `SameSite=Strict`. The server keeps only its SHA-256. 12 h idle limit, 7 days at most; a restart signs everyone out. |
+| Session         | Random 256-bit id in a cookie: `__Host-` prefix, `Secure`, `HttpOnly`, `SameSite=Strict`. The server keeps only its SHA-256, in `STATE_DIR/sessions.json` (mode 600), so a restart signs nobody out. A normal session ends when the browser closes, after 12 idle hours or after 7 days. With **Keep me signed in** ticked it lasts 30 days. Logging out, or replacing the account at `/setup`, ends it on the server. |
 | Cross-site requests | A cookie-authenticated write must carry our own `Origin`, the session's `X-CSRF-Token` and a JSON content type. The sign-in and set-up forms refuse a foreign `Origin`. |
 | Two-step codes  | TOTP (RFC 6238, SHA-1, 6 digits, 30 s), one step of clock drift allowed, each code accepted once. |
 | Throttling      | 5 failures (password, code, API token or set-up token) lock that client address out for 15 minutes (`429` with `Retry-After`). The address comes from `CF-Connecting-IP` when the request arrives through the tunnel. |

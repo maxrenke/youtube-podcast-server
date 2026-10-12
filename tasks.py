@@ -438,6 +438,22 @@ def _enqueue_subscription_poll(sub: dict) -> str:
 # Episodes on disk: publishing, deleting, retention
 # ---------------------------------------------------------------------------
 
+_ARCHIVE_CACHE: dict = {"mtime": None, "ids": frozenset()}
+
+
+def subscription_video_ids() -> frozenset:
+    """Ids of the videos that arrived through a subscription (yt-dlp's archive file)."""
+    try:
+        mtime = os.stat(ARCHIVE_FILE).st_mtime
+    except OSError:
+        return frozenset()
+    if _ARCHIVE_CACHE["mtime"] != mtime:
+        with open(ARCHIVE_FILE, "r", encoding="utf-8") as f:
+            ids = frozenset(line.split()[-1] for line in f if line.strip())
+        _ARCHIVE_CACHE.update(mtime=mtime, ids=ids)
+    return _ARCHIVE_CACHE["ids"]
+
+
 def _trim_info(info_path: str) -> None:
     """Rewrite yt-dlp's info.json keeping only what the feed needs."""
     try:

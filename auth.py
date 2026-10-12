@@ -4,7 +4,10 @@ Standard library only. One account, kept in ``STATE_DIR/auth.json``:
 
 - the password is stored as an scrypt hash with its own salt;
 - a session is a random 256-bit id in a cookie, known to the server only by its
-  SHA-256, with an idle and an absolute lifetime and its own CSRF token;
+  SHA-256, with its own CSRF token. A normal session ends when the browser
+  closes, after 12 idle hours or after 7 days; a "keep me signed in" session
+  lasts 30 days. Sessions are saved to ``STATE_DIR/sessions.json`` so a
+  restart does not sign anyone out;
 - two-step codes are standard TOTP (RFC 6238, SHA-1, 6 digits, 30 s), and a
   code cannot be used twice;
 - failed attempts are counted per client address and lock that address out.
@@ -23,10 +26,13 @@ from urllib.parse import quote
 
 STATE_DIR = os.environ.get("STATE_DIR", "state")
 AUTH_FILE = os.path.join(STATE_DIR, "auth.json")
+SESSIONS_FILE = os.path.join(STATE_DIR, "sessions.json")
 
 MIN_PASSWORD_LENGTH = 12
 SESSION_IDLE_SECONDS = 12 * 3600
 SESSION_MAX_SECONDS = 7 * 86400
+REMEMBER_SECONDS = 30 * 86400  # "keep me signed in"
+SESSION_SAVE_SECONDS = 300  # how stale the saved last-seen time may get
 MAX_FAILURES = 5
 LOCKOUT_SECONDS = 15 * 60
 
@@ -106,13 +112,18 @@ def load_account() -> dict | None:
         return None
 
 
-def _save_account(account: dict) -> None:
+def _write_private(path: str, data) -> None:
+    """Write JSON readable by the server's user only, replacing the file in one step."""
     os.makedirs(STATE_DIR, exist_ok=True)
-    tmp = AUTH_FILE + ".tmp"
+    tmp = path + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(account, f, indent=2)
-    os.replace(tmp, AUTH_FILE)
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def _save_account(account: dict) -> None:
+    _write_private(AUTH_FILE, account)
 
 
 def password_problem(username: str, password: str) -> str:
@@ -131,6 +142,7 @@ def set_account(username: str, password: str) -> None:
     _save_account({"username": username.strip(), "password": hash_password(password), "totp": None})
     with _LOCK:
         _SESSIONS.clear()
+        _save_sessions()
 
 
 def set_totp(secret: str | None) -> None:
@@ -168,13 +180,54 @@ def _key(session_id: str) -> str:
     return hashlib.sha256(session_id.encode("ascii", "ignore")).hexdigest()
 
 
-def create_session(username: str) -> str:
+def _expired(session: dict, now: float) -> bool:
+    if session.get("remember"):
+        return now - session["created"] > REMEMBER_SECONDS
+    return now - session["seen"] > SESSION_IDLE_SECONDS or now - session["created"] > SESSION_MAX_SECONDS
+
+
+_SAVED_FIELDS = ("username", "created", "seen", "csrf", "remember")
+_saved_at = 0.0
+
+
+def _save_sessions() -> None:
+    """Write the live sessions to disk. Call with _LOCK held.
+
+    Only the SHA-256 of each session id is stored, so the file cannot be used
+    to sign in.
+    """
+    global _saved_at
+    now = time.time()
+    live = {key: {f: s[f] for f in _SAVED_FIELDS if f in s} for key, s in _SESSIONS.items() if not _expired(s, now)}
+    try:
+        _write_private(SESSIONS_FILE, live)
+        _saved_at = now
+    except OSError as e:
+        print(f"[auth] could not save sessions: {e}", flush=True)
+
+
+def _load_sessions() -> None:
+    try:
+        with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    now = time.time()
+    with _LOCK:
+        for key, session in saved.items():
+            if all(f in session for f in ("username", "created", "seen", "csrf")) and not _expired(session, now):
+                _SESSIONS[key] = session
+
+
+def create_session(username: str, remember: bool = False) -> str:
     session_id = secrets.token_urlsafe(32)
     now = time.time()
     with _LOCK:
         _SESSIONS[_key(session_id)] = {
             "username": username, "created": now, "seen": now, "csrf": secrets.token_urlsafe(32),
+            "remember": bool(remember),
         }
+        _save_sessions()
     return session_id
 
 
@@ -187,16 +240,23 @@ def get_session(session_id: str) -> dict | None:
         session = _SESSIONS.get(_key(session_id))
         if not session:
             return None
-        if now - session["seen"] > SESSION_IDLE_SECONDS or now - session["created"] > SESSION_MAX_SECONDS:
+        if _expired(session, now):
             del _SESSIONS[_key(session_id)]
+            _save_sessions()
             return None
         session["seen"] = now
+        if now - _saved_at > SESSION_SAVE_SECONDS:
+            _save_sessions()  # keeps the saved last-seen time fresh enough for the idle limit
         return session
 
 
 def destroy_session(session_id: str) -> None:
     with _LOCK:
-        _SESSIONS.pop(_key(session_id), None)
+        if _SESSIONS.pop(_key(session_id), None) is not None:
+            _save_sessions()
+
+
+_load_sessions()
 
 
 # ---------------------------------------------------------------------------

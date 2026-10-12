@@ -67,8 +67,9 @@ def clean_downloads():
         if os.path.isfile(path):
             os.remove(path)
     server._EPISODE_CACHE.update(key=None, items=[])
-    if os.path.exists(auth.AUTH_FILE):
-        os.remove(auth.AUTH_FILE)
+    for path in (auth.AUTH_FILE, auth.SESSIONS_FILE, tasks.ARCHIVE_FILE):
+        if os.path.exists(path):
+            os.remove(path)
     auth._SESSIONS.clear()
     auth._FAILURES.clear()
     yield
@@ -172,6 +173,30 @@ def test_feed_is_well_formed_and_carries_episode_metadata():
     assert "<li>1:05 Part 2</li>" in notes
     assert item.find("podcast:chapters", NS).get("url") == "https://pod.example/chapters/vid00000002.json"
     assert items[1].find("podcast:chapters", NS) is None
+
+
+def test_subscription_episodes_are_ordered_by_upload_and_hand_added_ones_by_arrival():
+    day = 86400
+    now = 1_800_000_000
+    # a poll fetched three uploads newest first, so the oldest arrived last
+    for n, (vid, uploaded) in enumerate([("sub00000003", now - 1 * day), ("sub00000002", now - 40 * day), ("sub00000001", now - 90 * day)]):
+        stem = _add_episode(vid, f"upload {vid[-1]}", "Channel A", now + n * 60)
+        path = os.path.join(tasks.DOWNLOAD_DIR, stem + ".info.json")
+        with open(path, encoding="utf-8") as f:
+            info = json.load(f)
+        info["timestamp"] = uploaded
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(info, f)
+    with open(tasks.ARCHIVE_FILE, "w", encoding="utf-8") as f:
+        f.write("youtube sub00000001\nyoutube sub00000002\nyoutube sub00000003\n")
+    # an old video added by hand, two days before the poll
+    _add_episode("hand0000001", "added by hand", "Channel B", now - 2 * day)
+    server._EPISODE_CACHE.update(key=None, items=[])
+    assert [e["title"] for e in server.list_episodes()] == ["upload 3", "added by hand", "upload 2", "upload 1"]
+    items = ET.fromstring(server.generate_rss()).find("channel").findall("item")
+    assert [i.findtext("title") for i in items] == ["upload 3", "added by hand", "upload 2", "upload 1"]
+    from email.utils import parsedate_to_datetime
+    assert parsedate_to_datetime(items[2].findtext("pubDate")).timestamp() == now - 40 * day
 
 
 def test_channel_feed_holds_only_that_channel():
@@ -325,6 +350,49 @@ def test_sessions_expire(base_url):
     _, session, _ = _sign_in(base_url)
     record = next(iter(auth._SESSIONS.values()))
     record["created"] -= auth.SESSION_MAX_SECONDS + 1
+    assert _request(base_url + "/episodes", headers=session)[0] == 401
+
+
+def test_keep_me_signed_in(base_url):
+    auth.set_account("max", PASSWORD)
+    plain = _form(base_url + "/login", {"username": "max", "password": PASSWORD})[1]["Set-Cookie"]
+    kept = _form(base_url + "/login", {"username": "max", "password": PASSWORD, "remember": "1"})[1]["Set-Cookie"]
+    assert "Max-Age" not in plain  # gone when the browser closes
+    assert "Max-Age=2592000" in kept and "HttpOnly" in kept and "SameSite=Strict" in kept
+    plain_cookie, kept_cookie = ({"Cookie": c.split(";")[0]} for c in (plain, kept))
+    sessions = {s["remember"]: s for s in auth._SESSIONS.values()}
+    # 13 idle hours and 8 days old: past both limits of a normal session, fine for a kept one
+    for session in sessions.values():
+        session["seen"] -= 13 * 3600
+        session["created"] -= 8 * 86400
+    assert _request(base_url + "/episodes", headers=plain_cookie)[0] == 401
+    assert _request(base_url + "/episodes", headers=kept_cookie)[0] == 200
+    sessions[True]["created"] -= 23 * 86400  # now 31 days old
+    assert _request(base_url + "/episodes", headers=kept_cookie)[0] == 401
+
+
+def test_sessions_survive_a_restart_and_only_their_hash_is_stored(base_url):
+    cookie, session, write = _sign_in(base_url)
+    session_id = cookie.split(";")[0].split("=", 1)[1]
+    with open(auth.SESSIONS_FILE, encoding="utf-8") as f:
+        stored = f.read()
+    assert session_id not in stored and len(json.loads(stored)) == 1
+    auth._SESSIONS.clear()  # what a restart does to memory
+    assert _request(base_url + "/episodes", headers=session)[0] == 401
+    auth._load_sessions()
+    assert _request(base_url + "/episodes", headers=session)[0] == 200
+    # still the same session: its CSRF token works, and signing out removes it from the file
+    assert _request(base_url + "/logout", "POST", b"{}", write)[0] == 200
+    with open(auth.SESSIONS_FILE, encoding="utf-8") as f:
+        assert json.load(f) == {}
+    auth._SESSIONS.clear()
+    auth._load_sessions()
+    assert _request(base_url + "/episodes", headers=session)[0] == 401
+    # replacing the account signs every saved session out too
+    _, session, _ = _sign_in(base_url)
+    auth.set_account("max", PASSWORD)
+    auth._SESSIONS.clear()
+    auth._load_sessions()
     assert _request(base_url + "/episodes", headers=session)[0] == 401
 
 

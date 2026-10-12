@@ -6,6 +6,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# yt-dlp runs YouTube's player JavaScript in deno; without a runtime it warns that
+# extraction is deprecated and some formats go missing.
+RUN curl -L https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip -o /tmp/deno.zip \
+    && python -c "import zipfile; zipfile.ZipFile('/tmp/deno.zip').extractall('/usr/local/bin')" \
+    && chmod 755 /usr/local/bin/deno && rm /tmp/deno.zip && deno --version
+
 # The server runs as an unprivileged user. yt-dlp lives in a folder that user owns
 # so it can still update itself at start.
 RUN useradd --uid 1000 --create-home app \

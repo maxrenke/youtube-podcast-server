@@ -1,3 +1,4 @@
+import calendar
 import hmac
 import html
 import ipaddress
@@ -97,7 +98,7 @@ _EPISODE_CACHE: dict = {"key": None, "items": []}
 
 
 def list_episodes():
-    """Episodes, newest addition first. Cached until DOWNLOAD_DIR changes."""
+    """Episodes, newest first (see _scan_episodes for what "newest" means). Cached until DOWNLOAD_DIR changes."""
     try:
         mtime = os.stat(DOWNLOAD_DIR).st_mtime
     except OSError:
@@ -110,9 +111,17 @@ def list_episodes():
     return items
 
 
+def _upload_epoch(yyyymmdd: str) -> float:
+    try:
+        return calendar.timegm(time.strptime(yyyymmdd, "%Y%m%d"))
+    except ValueError:
+        return 0.0
+
+
 def _scan_episodes():
     if not os.path.isdir(DOWNLOAD_DIR):
         return []
+    subscribed = tasks.subscription_video_ids()
     items = []
     for fn in os.listdir(DOWNLOAD_DIR):
         if not fn.lower().endswith(".mp3"):
@@ -124,6 +133,15 @@ def _scan_episodes():
             continue
         info = _read_info_json(full)
         stem = os.path.splitext(fn)[0]
+        added = info.get("epoch") or stat.st_mtime
+        # Where an episode sits in the feed. One you added by hand is dated when you
+        # added it, so it surfaces at the top whatever its age. One a subscription
+        # pulled is dated when the video was uploaded: a poll fetches newest
+        # first, so dating those by arrival would stack a batch oldest on top.
+        published = added
+        if str(info.get("id")) in subscribed:
+            uploaded = info.get("timestamp") or _upload_epoch(str(info.get("upload_date") or ""))
+            published = min(uploaded, added) if uploaded else added
         # Prefer the square cover yt-dlp saved next to the mp3 over YouTube's 16:9 URL.
         if os.path.isfile(os.path.join(DOWNLOAD_DIR, stem + ".jpg")):
             thumbnail = f"{PUBLIC_BASE_URL}/thumb/{quote(stem + '.jpg')}"
@@ -137,7 +155,8 @@ def _scan_episodes():
             "size": stat.st_size,
             "mtime": stat.st_mtime,
             # When the episode was added; yt-dlp records it as "epoch" in the info.json.
-            "added": info.get("epoch") or stat.st_mtime,
+            "added": added,
+            "published": published,
             "video_id": info.get("id") or fn,
             "thumbnail": thumbnail,
             "uploader": info.get("channel") or info.get("uploader") or "",
@@ -150,7 +169,7 @@ def _scan_episodes():
                 for c in (info.get("chapters") or [])
             ],
         })
-    items.sort(key=lambda e: e["added"], reverse=True)
+    items.sort(key=lambda e: e["published"], reverse=True)
     return items
 
 
@@ -291,9 +310,9 @@ def generate_rss(feed: str = "", path: str = "/rss"):
         out.append("  <itunes:block>Yes</itunes:block>")
     for ep in eps:
         url = f"{PUBLIC_BASE_URL}/audio/{quote(ep['filename'])}"
-        # pubDate is when the episode was added, so new additions sort first in the
-        # app; the video's own upload date is in the description byline.
-        pub = formatdate(ep["added"], usegmt=True)
+        # pubDate: when you added it, or for subscription episodes when it was
+        # uploaded (see _scan_episodes). The upload date is also in the byline.
+        pub = formatdate(ep["published"], usegmt=True)
         out.append("  <item>")
         out.append(f"    <title>{sx.escape(ep['title'])}</title>")
         if ep["webpage_url"]:
@@ -363,6 +382,8 @@ main{width:100%;max-width:380px}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:24px}
 h1{font-size:20px;margin-bottom:16px}
 label{display:block;margin:16px 0 4px;font-weight:600;font-size:13px}
+label.check{display:flex;align-items:center;gap:8px;font-weight:400;font-size:15px;cursor:pointer}
+label.check input{width:auto;accent-color:var(--accent)}
 form .btn{width:100%;margin-top:24px}
 .card p.muted{margin-bottom:8px}
 </style>
@@ -379,6 +400,7 @@ _LOGIN_FORM = """<form method="post" action="/login">
 <label for="p">Password</label><input id="p" name="password" type="password" autocomplete="current-password" required>
 <label for="c">Two-step code <span class="muted">(if turned on)</span></label>
 <input id="c" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="8">
+<label class="check"><input type="checkbox" name="remember" value="1"> Keep me signed in on this device for 30 days</label>
 <button class="btn primary">Sign in</button>
 </form>"""
 
@@ -628,7 +650,7 @@ async function refresh(){
     <div class="grow">
       <h3 class="title">${esc(e.title)}</h3>
       <div class="meta"><span>${esc(e.uploader || 'Unknown channel')}</span><span>${fmtDur(e.duration)}</span><span>${fmtSize(e.size)}</span>
-        <span>added ${fmtDay(e.added*1000)}</span>${e.chapters.length ? `<span>${e.chapters.length} chapters</span>` : ''}</div>
+        <span>${e.published < e.added ? 'uploaded' : 'added'} ${fmtDay(e.published*1000)}</span>${e.chapters.length ? `<span>${e.chapters.length} chapters</span>` : ''}</div>
       <audio controls preload="none" src="/audio/${encodeURIComponent(e.filename)}"></audio>
       ${e.description ? `<details><summary>Description</summary><pre>${esc(e.description)}</pre></details>` : ''}
     </div>
@@ -838,9 +860,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def _cookie(self, session_id, max_age):
+    def _cookie(self, session_id, max_age=None):
+        """The session cookie. Without ``max_age`` the browser drops it when it closes."""
+        lifetime = "" if max_age is None else f"; Max-Age={max_age}"
         secure = "; Secure" if SECURE else ""
-        return f"{COOKIE_NAME}={session_id}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure}"
+        return f"{COOKIE_NAME}={session_id}; Path=/; HttpOnly; SameSite=Strict{lifetime}{secure}"
 
     def _session_id(self) -> str:
         try:
@@ -1119,8 +1143,10 @@ class Handler(BaseHTTPRequestHandler):
         username = form.get("username", "")
         if auth.check_login(username, form.get("password", ""), form.get("code", "")):
             auth.clear_failures(client)
-            print(f"[auth] sign-in from {client}", flush=True)
-            self._redirect("/", self._cookie(auth.create_session(username.strip()), auth.SESSION_MAX_SECONDS))
+            remember = form.get("remember") == "1"
+            print(f"[auth] sign-in from {client}{' (kept signed in)' if remember else ''}", flush=True)
+            session_id = auth.create_session(username.strip(), remember)
+            self._redirect("/", self._cookie(session_id, auth.REMEMBER_SECONDS if remember else None))
         else:
             auth.record_failure(client)
             print(f"[auth] failed sign-in from {client}", flush=True)
