@@ -528,7 +528,8 @@ border-radius:var(--radius-sm);padding:12px;margin:0;white-space:pre-wrap;overfl
   <p class="small"><span class="pill" id="logStatus"></span> <span id="logWhat"></span></p>
   <h3>Command</h3><pre id="logCmd" tabindex="0"></pre>
   <h3>Output <span id="logAge"></span></h3><pre id="logOut" tabindex="0"></pre>
-  <div class="buttons"><button class="btn" type="button" id="logCopy">Copy command</button>
+  <div class="buttons"><button class="btn danger-solid" type="button" id="logStop" hidden>Stop task</button>
+    <button class="btn" type="button" id="logCopy">Copy command</button>
     <button class="btn primary" value="close">Close</button></div>
 </form></dialog>
 
@@ -692,6 +693,7 @@ async function loadLog(id){
   $('logStatus').textContent = t.status; $('logStatus').className = 'pill ' + t.status;
   $('logWhat').textContent = (t.type === 'subscription' ? 'Subscription check: ' : 'Video: ') + t.url;
   $('logCmd').textContent = t.command || '(not started yet)';
+  $('logStop').hidden = t.status !== 'downloading' && t.status !== 'queued';
   $('logAge').textContent = t.status === 'downloading' && t.progress_age >= 5
     ? '- last line ' + fmtAge(t.progress_age) + ' ago' + (t.converted_bytes ? ', ' + fmtSize(t.converted_bytes) + ' of mp3 written' : '') : '';
   const atEnd = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
@@ -699,7 +701,9 @@ async function loadLog(id){
   if(out.textContent !== text){ out.textContent = text; if(atEnd) out.scrollTop = out.scrollHeight; }
   if(t.status !== 'downloading' && t.status !== 'queued') clearInterval(logTimer);
 }
+let logId;
 function openLog(id){
+  logId = id;
   $('logOut').textContent = 'Loading...'; $('logCmd').textContent = ''; $('logAge').textContent = '';
   $('logDlg').showModal();
   $('logOut').scrollTop = 0;
@@ -708,6 +712,11 @@ function openLog(id){
   logTimer = setInterval(() => loadLog(id), 1500);
 }
 $('logDlg').addEventListener('close', () => clearInterval(logTimer));
+$('logStop').onclick = async () => {
+  const r = await api('POST', '/tasks/' + encodeURIComponent(logId) + '/cancel');
+  if(r.ok) toast('Task stopped'); else toast(await errorOf(r), true);
+  loadLog(logId); tick();
+};
 $('logCopy').onclick = async () => {
   try { await navigator.clipboard.writeText($('logCmd').textContent); toast('Command copied'); }
   catch(e) { toast('Could not copy - select the text instead', true); }
@@ -1211,13 +1220,22 @@ class Handler(BaseHTTPRequestHandler):
             data = self._read_json()
             if data is not None:
                 self._two_step(data)
+        elif self.path.startswith("/tasks/") and self.path.endswith("/cancel"):
+            status = tasks.cancel_task(unquote(self.path[len("/tasks/"):-len("/cancel")]))
+            if status is None:
+                self._json(404, {"error": "not found"})
+            elif status != tasks.STATUS_CANCELLED:
+                self._json(409, {"error": "that task has already finished", "status": status})
+            else:
+                self._json(200, {"status": status})
         elif self.path == "/download":
             data = self._read_json()
             if data is None:
                 return
             url = (data.get("url") or "").strip()
-            if not is_valid_url(url):
-                self._json(400, {"error": tasks.URL_RULE})
+            problem = tasks.download_problem(url)
+            if problem:
+                self._json(400, {"error": problem})
                 return
             task_id = enqueue_download(url)
             self._json(202, {"task_id": task_id})

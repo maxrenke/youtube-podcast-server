@@ -198,6 +198,9 @@ Response:
 Uses `yt-dlp --no-playlist`, so if you paste a video URL that happens to
 have a `&list=` parameter, only that single video is pulled.
 
+A channel or playlist address is refused here (`400`, "use Subscribe for
+it"): handed to the single-video path it would fetch everything behind it.
+
 The URL must start with `http://` or `https://`; anything else gets
 `400 {"error": "url must start with http:// or https://"}`. The same rule
 applies to `POST /subscriptions`.
@@ -282,6 +285,12 @@ runs, `progress` is the newest line and `progress_age` is how many seconds
 ago it was printed - the conversion to mp3 prints nothing while it works, so
 that is the only sign of life during it. The admin page shows this under
 **Details** in the Activity list.
+
+### `POST /tasks/<id>/cancel` - stop a task
+
+Kills the task's yt-dlp process (or takes it out of the queue) and marks it
+`cancelled`. `409` if it has already finished. **Stop task** in the Details
+dialog does this.
 
 ### `GET /audio/<filename>` - download an mp3
 

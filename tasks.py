@@ -75,6 +75,8 @@ TASKS_LOCK = threading.Lock()
 # task itself so the task list stays small; the admin page fetches it on demand.
 TASK_LOGS: dict[str, deque] = {}
 LOG_LINES = 400
+# The yt-dlp process of each running task, so a task can be stopped.
+PROCS: dict[str, subprocess.Popen] = {}
 
 SUBSCRIPTIONS: dict[str, dict] = {}
 SUBS_LOCK = threading.Lock()
@@ -83,6 +85,7 @@ STATUS_QUEUED = "queued"
 STATUS_DOWNLOADING = "downloading"
 STATUS_DONE = "done"
 STATUS_ERROR = "error"
+STATUS_CANCELLED = "cancelled"
 _PENDING = (STATUS_QUEUED, STATUS_DOWNLOADING)
 
 TYPE_VIDEO = "video"
@@ -140,6 +143,22 @@ def normalize_subscription_url(url: str) -> str:
     return f"https://www.youtube.com/{match.group(1)}/videos"
 
 
+def download_problem(url: str) -> str:
+    """Why this address cannot be added as a single video, or an empty string.
+
+    A channel or playlist address handed to the single-video path makes yt-dlp
+    fetch everything behind it - a whole channel as one task.
+    """
+    if not is_valid_url(url):
+        return URL_RULE
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    on_youtube = host == "youtube.com" or host.endswith(".youtube.com")
+    if on_youtube and (_CHANNEL_PATH.match(parts.path) or parts.path.rstrip("/") == "/playlist"):
+        return "that is a channel or playlist address - use Subscribe for it"
+    return ""
+
+
 def _ensure_dirs() -> None:
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     os.makedirs(INCOMING_DIR, exist_ok=True)
@@ -189,6 +208,11 @@ def _load_tasks() -> None:
             if not sub:
                 continue
             task["url"], task["max_items"] = sub["url"], sub.get("max_items", 0)
+        elif download_problem(task["url"]):
+            # Queued before channel and playlist addresses were refused as single videos.
+            print(f"[tasks] dropped {task['url']}: {download_problem(task['url'])}", flush=True)
+            shutil.rmtree(os.path.join(INCOMING_DIR, task["id"]), ignore_errors=True)
+            continue
         task["status"] = STATUS_QUEUED
         with TASKS_LOCK:
             TASKS[task["id"]] = task
@@ -254,6 +278,25 @@ def get_task(task_id: str) -> dict | None:
 def list_tasks() -> list[dict]:
     with TASKS_LOCK:
         return [_view(t) for t in TASKS.values()]
+
+
+def cancel_task(task_id: str) -> str | None:
+    """Stop a queued or running task. Returns its status afterwards, None if unknown."""
+    with TASKS_LOCK:
+        task = TASKS.get(task_id)
+        if not task:
+            return None
+        if task["status"] not in _PENDING:
+            return task["status"]
+        task["cancelled"] = True
+        proc = PROCS.get(task_id)
+        if task["status"] == STATUS_QUEUED:
+            # nothing is running yet; the worker skips it when its turn comes
+            task["status"], task["ended"] = STATUS_CANCELLED, _now_iso()
+    if proc:
+        proc.kill()  # the worker sees yt-dlp end and marks the task cancelled
+    _save_tasks()
+    return STATUS_CANCELLED
 
 
 def get_task_log(task_id: str) -> dict | None:
@@ -570,6 +613,8 @@ def _run_ytdlp(cmd: list[str], task: dict, timeout: int, workdir: str = "") -> t
                             text=True, encoding="utf-8", errors="replace")
     killer = threading.Timer(timeout, proc.kill)
     killer.start()
+    with TASKS_LOCK:
+        PROCS[task["id"]] = proc
     try:
         for raw in proc.stdout or []:
             line = raw.rstrip()
@@ -590,6 +635,10 @@ def _run_ytdlp(cmd: list[str], task: dict, timeout: int, workdir: str = "") -> t
         proc.wait()
     finally:
         killer.cancel()
+        with TASKS_LOCK:
+            PROCS.pop(task["id"], None)
+    if task.get("cancelled"):
+        raise RuntimeError("stopped")
     error = ""
     if proc.returncode != 0:
         error = "\n".join(errors)[-2000:] or "\n".join(list(log)[-5:]) or "yt-dlp failed"
@@ -599,7 +648,8 @@ def _run_ytdlp(cmd: list[str], task: dict, timeout: int, workdir: str = "") -> t
 def _ytdlp_single(task: dict, workdir: str) -> str | None:
     """Download one video; returns the published mp3 path or None."""
     _prepare_workdir(workdir)
-    cmd = ["yt-dlp", *_ytdlp_common_args(workdir), "--no-playlist", "--", task["url"]]
+    # --playlist-items 1 is a backstop: whatever the address turns out to be, one item at most.
+    cmd = ["yt-dlp", *_ytdlp_common_args(workdir), "--no-playlist", "--playlist-items", "1", "--", task["url"]]
     paths, error = _run_ytdlp(cmd, task, 60 * 60, workdir)
     if error and not paths:
         raise RuntimeError(error)
@@ -684,11 +734,18 @@ def _worker(q: "Queue[dict]") -> None:
     while True:
         task = q.get()
         try:
+            if task.get("cancelled"):
+                continue  # stopped while it was still waiting
             _set(task, status=STATUS_DOWNLOADING, started=_now_iso(),
                  attempts=int(task.get("attempts") or 0) + 1)
             _run_task(task)
             _set(task, status=STATUS_DONE, ended=_now_iso(), error=None)
         except Exception as e:  # noqa: BLE001 - one bad task must not kill the worker
+            if task.get("cancelled"):
+                _set(task, status=STATUS_CANCELLED, ended=_now_iso(), error=None)
+                if task["type"] == TYPE_VIDEO:
+                    shutil.rmtree(os.path.join(INCOMING_DIR, task["id"]), ignore_errors=True)
+                continue
             error = str(e)[:2000]
             # A failed single download gets one more try; a failed poll simply
             # runs again at the subscription's next interval.

@@ -518,6 +518,78 @@ def test_publish_trims_info_and_stale_audio_is_cleared():
                     "chapters": [{"start_time": 1.5, "title": "c"}]}
 
 
+@pytest.mark.parametrize("url", [
+    "https://www.youtube.com/@qnaline", "https://www.youtube.com/@qnaline/videos", "https://www.youtube.com/channel/UC123",
+    "https://www.youtube.com/playlist?list=PL123", "https://m.youtube.com/c/Name/streams",
+])
+def test_a_channel_or_playlist_is_not_a_single_video(url, base_url):
+    assert "use Subscribe" in tasks.download_problem(url)
+    before = len(tasks.list_tasks())
+    status, _, body = _request(f"{base_url}/download", "POST", {"url": url}, AUTH)
+    assert status == 400 and "use Subscribe" in json.loads(body)["error"]
+    assert len(tasks.list_tasks()) == before
+
+
+@pytest.mark.parametrize("url", ["https://youtu.be/abc", "https://www.youtube.com/watch?v=abc&list=PL123",
+                                 "https://www.youtube.com/shorts/abc", "https://www.youtube.com/live/abc"])
+def test_single_video_addresses_are_accepted(url):
+    assert tasks.download_problem(url) == ""
+
+
+def test_a_queued_channel_download_is_dropped_on_start(monkeypatch):
+    with open(tasks.TASKS_FILE, "w", encoding="utf-8") as f:
+        json.dump([
+            {"id": "bad", "type": "video", "url": "https://www.youtube.com/@qnaline", "status": "downloading"},
+            {"id": "good", "type": "video", "url": "https://youtu.be/abc", "status": "queued"},
+        ], f)
+    monkeypatch.setattr(tasks, "TASKS", {})
+    monkeypatch.setattr(tasks, "VIDEO_QUEUE", tasks.Queue())  # no worker drains this one
+    try:
+        tasks._load_tasks()
+        assert list(tasks.TASKS) == ["good"]
+    finally:
+        os.remove(tasks.TASKS_FILE)
+
+
+def test_a_running_task_can_be_stopped(base_url):
+    task = {"id": "long1", "type": "video", "url": "https://youtu.be/abc", "status": "downloading", "attempts": 1}
+    tasks.TASKS["long1"] = task
+    outcome = {}
+
+    def run():
+        try:
+            tasks._run_ytdlp([sys.executable, "-u", "-c", "import time; print('working'); time.sleep(60)"], task, 120)
+        except RuntimeError as e:
+            outcome["error"] = str(e)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        for _ in range(100):
+            if "long1" in tasks.PROCS and tasks.TASK_LOGS.get("long1"):
+                break
+            time.sleep(0.05)
+        assert _request(f"{base_url}/tasks/long1/cancel", "POST", b"{}")[0] == 401
+        started = time.time()
+        status, _, body = _request(f"{base_url}/tasks/long1/cancel", "POST", b"{}", AUTH)
+        worker.join(10)
+        assert (status, json.loads(body)) == (200, {"status": "cancelled"})
+        assert not worker.is_alive() and time.time() - started < 10  # yt-dlp was killed, not waited for
+        assert outcome == {"error": "stopped"} and "long1" not in tasks.PROCS
+        # a queued task is marked straight away; a finished one cannot be stopped
+        tasks.TASKS["q1"] = {"id": "q1", "type": "video", "url": "https://youtu.be/abc", "status": "queued"}
+        assert json.loads(_request(f"{base_url}/tasks/q1/cancel", "POST", b"{}", AUTH)[2]) == {"status": "cancelled"}
+        assert tasks.TASKS["q1"]["status"] == "cancelled"
+        tasks.TASKS["d1"] = {"id": "d1", "type": "video", "url": "https://youtu.be/abc", "status": "done"}
+        assert _request(f"{base_url}/tasks/d1/cancel", "POST", b"{}", AUTH)[0] == 409
+        assert _request(f"{base_url}/tasks/nope/cancel", "POST", b"{}", AUTH)[0] == 404
+    finally:
+        for task_id in ("long1", "q1", "d1"):
+            tasks.TASKS.pop(task_id, None)
+            tasks.TASK_LOGS.pop(task_id, None)
+        tasks._save_tasks()
+
+
 def test_a_run_keeps_its_command_and_live_output(base_url):
     workdir = os.path.join(tasks.INCOMING_DIR, "run-test")
     os.makedirs(workdir, exist_ok=True)
