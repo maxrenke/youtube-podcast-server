@@ -38,6 +38,14 @@ POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", str(60 * 60)
 SCHEDULER_TICK_SECONDS = int(os.environ.get("SCHEDULER_TICK_SECONDS", "60"))
 # LAME VBR quality, 0 (largest) to 9. 5 is about 130 kbps, plenty for speech.
 AUDIO_QUALITY = os.environ.get("AUDIO_QUALITY", "5")
+# What an episode's audio is:
+#   m4a        YouTube's own 128 kbps AAC stream, kept as it is. Nothing is
+#              re-encoded, so adding takes seconds and no quality is lost.
+#   m4a-small  YouTube's 48 kbps AAC stream, also kept as it is: about a third
+#              of the size, fine for speech.
+#   mp3        re-encode to mp3 at AUDIO_QUALITY (minutes for a long video).
+AUDIO_FORMAT = os.environ.get("AUDIO_FORMAT", "m4a").lower()
+AUDIO_EXTS = (".m4a", ".mp3")
 # How many entries from the top of a channel are looked at on each poll (0 = all).
 SUB_MAX_ITEMS = int(os.environ.get("SUB_MAX_ITEMS", "10"))
 # Retention, both off by default: drop episodes older than KEEP_DAYS, and keep
@@ -408,6 +416,34 @@ def remove_subscription(sub_id: str) -> bool:
     return True
 
 
+def set_subscription_items(sub_id: str, max_items: int) -> dict | None:
+    """Change how many entries from the top of the list each poll looks at (0 = all)."""
+    with SUBS_LOCK:
+        sub = SUBSCRIPTIONS.get(sub_id)
+        if not sub:
+            return None
+        sub["max_items"] = max(0, int(max_items))
+    _save_subscriptions()
+    return get_subscription(sub_id)
+
+
+def check_subscription_now(sub_id: str) -> str | None:
+    """Poll a subscription now instead of at its next interval. Returns the poll's task id.
+
+    If a poll of it is already queued or running, that one is returned.
+    """
+    sub = get_subscription(sub_id)
+    if not sub:
+        return None
+    with TASKS_LOCK:
+        pending = next((t["id"] for t in TASKS.values()
+                        if t.get("subscription_id") == sub_id and t["status"] in _PENDING), None)
+    if pending:
+        return str(pending)
+    _update_subscription(sub_id, next_poll=time.time() + sub["interval_seconds"])
+    return _enqueue_subscription_poll(sub)
+
+
 def _update_subscription(sub_id: str, **fields) -> None:
     with SUBS_LOCK:
         sub = SUBSCRIPTIONS.get(sub_id)
@@ -469,22 +505,30 @@ def _trim_info(info_path: str) -> None:
     _write_json(info_path, slim)
 
 
-def _publish(incoming_mp3: str) -> str | None:
+def _publish(incoming_audio: str) -> str | None:
     """Move a finished episode from its staging folder into DOWNLOAD_DIR.
 
-    Sidecars go first and the mp3 last, so the feed never shows an episode
-    without its metadata. Returns the published mp3 path.
+    Sidecars go first and the audio last, so the feed never shows an episode
+    without its metadata. Returns the published audio path.
     """
-    if not incoming_mp3.lower().endswith(".mp3") or not os.path.exists(incoming_mp3):
+    stem, audio_ext = os.path.splitext(os.path.basename(incoming_audio))
+    audio_ext = audio_ext.lower()
+    if audio_ext not in AUDIO_EXTS or not os.path.exists(incoming_audio):
         return None
-    workdir = os.path.dirname(incoming_mp3)
-    stem = os.path.splitext(os.path.basename(incoming_mp3))[0]
+    workdir = os.path.dirname(incoming_audio)
     _trim_info(os.path.join(workdir, stem + ".info.json"))
-    for ext in (".info.json", ".jpg", ".mp3"):
+    for ext in (".info.json", ".jpg", audio_ext):
         src = os.path.join(workdir, stem + ext)
         if os.path.exists(src):
             os.replace(src, os.path.join(DOWNLOAD_DIR, stem + ext))
-    return os.path.join(DOWNLOAD_DIR, stem + ".mp3")
+    # the same video fetched again in the other format replaces the old file
+    for other in AUDIO_EXTS:
+        if other != audio_ext:
+            try:
+                os.remove(os.path.join(DOWNLOAD_DIR, stem + other))
+            except FileNotFoundError:
+                pass
+    return os.path.join(DOWNLOAD_DIR, stem + audio_ext)
 
 
 def _episodes_on_disk() -> list[dict]:
@@ -493,7 +537,7 @@ def _episodes_on_disk() -> list[dict]:
         return []
     found = []
     for fn in os.listdir(DOWNLOAD_DIR):
-        if not fn.lower().endswith(".mp3"):
+        if not fn.lower().endswith(AUDIO_EXTS):
             continue
         stem = os.path.splitext(fn)[0]
         info: dict = {}
@@ -516,7 +560,7 @@ def _episodes_on_disk() -> list[dict]:
 
 
 def _remove_files(stem: str) -> None:
-    for ext in (".mp3", ".jpg", ".info.json"):
+    for ext in (*AUDIO_EXTS, ".jpg", ".info.json"):
         try:
             os.remove(os.path.join(DOWNLOAD_DIR, stem + ext))
         except FileNotFoundError:
@@ -560,19 +604,33 @@ _SQUARE_THUMB = (
 )
 
 
+def _audio_args() -> list[str]:
+    """Which stream to take and what to turn it into (see AUDIO_FORMAT)."""
+    if AUDIO_FORMAT == "mp3":
+        return ["-x", "--audio-format", "mp3", "--audio-quality", AUDIO_QUALITY]
+    # Among same-quality streams yt-dlp prefers the original language over dubs.
+    small = "bestaudio[ext=m4a][abr<=64]/" if AUDIO_FORMAT == "m4a-small" else ""
+    return [
+        "-f", small + "bestaudio[ext=m4a]/bestaudio",
+        # A no-op when the stream already is m4a; converts only if YouTube had none.
+        "-x", "--audio-format", "m4a",
+        # Index at the front of the file, so a player can start before it has all of it.
+        "--ppa", "Metadata+ffmpeg_o:-movflags +faststart",
+    ]
+
+
 def _ytdlp_common_args(workdir: str) -> list[str]:
     """Options shared by single and playlist downloads.
 
-    Each episode ends up as three files with the same stem: ``.mp3`` (ID3 tags,
-    chapters and cover art embedded), ``.jpg`` (the same square cover, served at
-    ``/thumb/``) and ``.info.json`` (source of the RSS item metadata).
+    Each episode ends up as three files with the same stem: the audio (``.m4a``
+    or ``.mp3``, with tags, chapters and cover art embedded), ``.jpg`` (the same
+    square cover, served at ``/thumb/``) and ``.info.json`` (source of the RSS
+    item metadata).
     """
     # "%(xx|literal)s" is yt-dlp's way to set a metadata field to a fixed string.
     album = FEED_TITLE.replace("%", "").replace(")", "").replace("|", "")
     return [
-        "-x",
-        "--audio-format", "mp3",
-        "--audio-quality", AUDIO_QUALITY,
+        *_audio_args(),
         "--embed-metadata",
         "--embed-chapters",
         "--embed-thumbnail",

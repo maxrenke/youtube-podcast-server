@@ -77,7 +77,8 @@ All via env vars. Defaults shown.
 | `FEED_CATEGORY`           | `Technology`                     | `<itunes:category>`. Must be one of Apple's category names.                          |
 | `FEED_PRIVATE`            | `1`                              | Emits `<itunes:block>Yes</itunes:block>` so directories do not list the feed. `0` to drop it. |
 | `API_TOKEN`               | unset                            | Secret for POST and DELETE requests. Unset = no authentication (a warning is logged). |
-| `AUDIO_QUALITY`           | `5`                              | LAME VBR quality, 0 (largest) to 9. 5 is about 130 kbps.                             |
+| `AUDIO_FORMAT`            | `m4a`                            | `m4a`: YouTube's own 128 kbps AAC stream kept as it is - no re-encoding, so adding is fast and nothing is lost (about 1 MB per minute). `m4a-small`: its 48 kbps stream, about a third of that. `mp3`: re-encode at `AUDIO_QUALITY`. |
+| `AUDIO_QUALITY`           | `5`                              | Only with `AUDIO_FORMAT=mp3`: LAME VBR quality, 0 (largest) to 9. 5 is about 0.55 MB per minute. |
 | `SUB_MAX_ITEMS`           | `10`                             | Entries from the top of a channel looked at per poll. 0 = all. Playlists default to all. |
 | `KEEP_DAYS`               | `0`                              | Delete episodes added more than this many days ago. 0 = off.                         |
 | `KEEP_COUNT`              | `0`                              | Keep only this many newest episodes. 0 = off.                                        |
@@ -226,6 +227,13 @@ Accepted:
   `.../channel/CHANNEL_ID`, `.../c/NAME`, `.../user/NAME`, with or without a
   tab such as `/featured`, `/streams` or `/shorts` - all become `.../videos`
 
+`PATCH /subscriptions/<id>` with `{"max_items": <int>}` changes how many
+entries each check looks at afterwards (0 = everything).
+`POST /subscriptions/<id>/check` checks it now instead of at its next
+interval and answers `202 {"task_id": ...}`; if a check of it is already
+waiting or running, that one is returned. The admin page has both on each
+subscription row.
+
 Optional body fields:
 
 - `"interval_seconds": <int>` overrides the global poll interval.
@@ -320,7 +328,7 @@ stem in `DOWNLOAD_DIR`:
 
 | File                    | Contents                                                                 |
 |-------------------------|--------------------------------------------------------------------------|
-| `Title [id].mp3`        | Audio plus ID3: title, artist (channel), date, description, source URL, album (`FEED_TITLE`), genre `Podcast`, chapters, and the square cover. |
+| `Title [id].m4a` (or `.mp3`) | The audio with tags: title, artist (channel), date, description, album (`FEED_TITLE`), genre `Podcast`, chapters, and the square cover. An m4a has its index at the front, so a player can start before it has the whole file. |
 | `Title [id].jpg`        | 1400x1400 cover: the 16:9 thumbnail centred over a blurred fill of itself, so nothing is cropped. |
 | `Title [id].info.json`  | yt-dlp's full metadata dump; the RSS item is built from it.              |
 

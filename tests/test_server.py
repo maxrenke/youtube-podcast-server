@@ -38,11 +38,11 @@ NS = {
 }
 
 
-def _add_episode(video_id, title, channel, added, chapters=(), cover=True):
+def _add_episode(video_id, title, channel, added, chapters=(), cover=True, ext=".mp3"):
     # like yt-dlp, keep characters a filesystem rejects out of the file name only
     stem = f"{title} [{video_id}]".replace("<", "").replace(">", "")
     base = os.path.join(tasks.DOWNLOAD_DIR, stem)
-    with open(base + ".mp3", "wb") as f:
+    with open(base + ext, "wb") as f:
         f.write(bytes(range(256)) * 4)
     if cover:
         with open(base + ".jpg", "wb") as f:
@@ -197,6 +197,76 @@ def test_subscription_episodes_are_ordered_by_upload_and_hand_added_ones_by_arri
     assert [i.findtext("title") for i in items] == ["upload 3", "added by hand", "upload 2", "upload 1"]
     from email.utils import parsedate_to_datetime
     assert parsedate_to_datetime(items[2].findtext("pubDate")).timestamp() == now - 40 * day
+
+
+def test_m4a_episodes_are_listed_served_and_deleted_like_mp3(base_url):
+    stem = _add_episode("vid00000007", "Kept as it came", "Channel A", 2000, ext=".m4a")
+    _add_episode("vid00000008", "Re-encoded", "Channel A", 1000)
+    items = ET.fromstring(server.generate_rss()).find("channel").findall("item")
+    kinds = {i.findtext("title"): (i.find("enclosure").get("type"), i.find("enclosure").get("url")[-4:]) for i in items}
+    assert kinds == {"Kept as it came": ("audio/x-m4a", ".m4a"), "Re-encoded": ("audio/mpeg", ".mp3")}
+    status, headers, body = _request(f"{base_url}/audio/{urllib.request.quote(stem)}.m4a", headers={"Range": "bytes=0-3"})
+    assert (status, headers["Content-Type"], body) == (206, "audio/mp4", bytes(range(4)))
+    assert _request(f"{base_url}/audio/{urllib.request.quote(stem)}.jpg")[0] == 400
+    assert _request(f"{base_url}/episodes/vid00000007", "DELETE", headers=AUTH)[0] == 200
+    assert not [f for f in os.listdir(tasks.DOWNLOAD_DIR) if f.startswith(stem)]
+
+
+def test_fetching_a_video_again_in_the_other_format_replaces_it():
+    _add_episode("vid00000009", "Twice", "Channel A", 1000)  # the mp3 from before
+    workdir = os.path.join(tasks.INCOMING_DIR, "task-m4a")
+    os.makedirs(workdir, exist_ok=True)
+    base = os.path.join(workdir, "Twice [vid00000009]")
+    with open(base + ".m4a", "wb") as f:
+        f.write(b"aac")
+    with open(base + ".info.json", "w", encoding="utf-8") as f:
+        json.dump({"id": "vid00000009", "title": "Twice", "epoch": 5}, f)
+    assert tasks._publish(base + ".m4a") == os.path.join(tasks.DOWNLOAD_DIR, "Twice [vid00000009].m4a")
+    audio = sorted(f for f in os.listdir(tasks.DOWNLOAD_DIR) if f.startswith("Twice") and not f.endswith((".json", ".jpg")))
+    assert audio == ["Twice [vid00000009].m4a"]
+    server._EPISODE_CACHE.update(key=None, items=[])
+    assert [e["video_id"] for e in server.list_episodes()] == ["vid00000009"]
+
+
+def test_audio_format_picks_the_stream(monkeypatch):
+    monkeypatch.setattr(tasks, "AUDIO_FORMAT", "m4a")
+    args = tasks._audio_args()
+    assert args[:2] == ["-f", "bestaudio[ext=m4a]/bestaudio"] and "--audio-quality" not in args
+    monkeypatch.setattr(tasks, "AUDIO_FORMAT", "m4a-small")
+    assert tasks._audio_args()[1].startswith("bestaudio[ext=m4a][abr<=64]/")
+    monkeypatch.setattr(tasks, "AUDIO_FORMAT", "mp3")
+    assert tasks._audio_args() == ["-x", "--audio-format", "mp3", "--audio-quality", tasks.AUDIO_QUALITY]
+
+
+def test_subscription_controls(base_url, monkeypatch):
+    monkeypatch.setattr(tasks, "SUB_QUEUE", tasks.Queue())  # no worker drains this one
+    sub = tasks.add_subscription("https://www.youtube.com/@SomeChannel")
+    try:
+        target = f"{base_url}/subscriptions/{sub['id']}"
+        assert _request(target, "PATCH", {"max_items": 3}, {"Content-Type": "application/json"})[0] == 401
+        status, _, body = _request(target, "PATCH", {"max_items": 3}, AUTH)
+        assert (status, json.loads(body)["max_items"], tasks.get_subscription(sub["id"])["max_items"]) == (200, 3, 3)
+        for bad in ({"max_items": -1}, {"max_items": "3"}, {"max_items": True}, {}):
+            assert _request(target, "PATCH", bad, AUTH)[0] == 400
+        assert _request(f"{base_url}/subscriptions/nope", "PATCH", {"max_items": 3}, AUTH)[0] == 404
+        with open(tasks.SUBSCRIPTIONS_FILE, encoding="utf-8") as f:
+            assert json.load(f)[0]["max_items"] == 3  # saved, not just in memory
+
+        assert _request(target + "/check", "POST", b"{}", {"Content-Type": "application/json"})[0] == 401
+        status, _, body = _request(target + "/check", "POST", b"{}", AUTH)
+        first = json.loads(body)["task_id"]
+        assert status == 202 and tasks.get_task(first)["max_items"] == 3
+        # asking again while that check is still waiting does not queue a second one
+        assert json.loads(_request(target + "/check", "POST", b"{}", AUTH)[2])["task_id"] == first
+        assert tasks.SUB_QUEUE.qsize() == 1
+        assert tasks.get_subscription(sub["id"])["next_poll"] > time.time()
+        assert _request(f"{base_url}/subscriptions/nope/check", "POST", b"{}", AUTH)[0] == 404
+    finally:
+        tasks.remove_subscription(sub["id"])
+        for task in tasks.list_tasks():
+            if task.get("subscription_id") == sub["id"]:
+                tasks.TASKS.pop(task["id"], None)
+        tasks._save_tasks()
 
 
 def test_channel_feed_holds_only_that_channel():

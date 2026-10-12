@@ -25,6 +25,7 @@ services:
       - POLL_INTERVAL_SECONDS=${POLL_INTERVAL_SECONDS:-3600}
       # Secret for POST/DELETE requests. Put API_TOKEN=... in a .env file next to this one.
       - API_TOKEN=${API_TOKEN:-}
+      - AUDIO_FORMAT=${AUDIO_FORMAT:-m4a}
       - AUDIO_QUALITY=${AUDIO_QUALITY:-5}
       - SUB_MAX_ITEMS=${SUB_MAX_ITEMS:-10}
       - KEEP_DAYS=${KEEP_DAYS:-0}

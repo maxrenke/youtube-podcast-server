@@ -59,6 +59,11 @@ PORT = int(os.environ.get("PORT", "8080"))
 START_TIME = time.time()
 
 
+# Served content type per audio extension, and the type podcast apps expect in the feed.
+_AUDIO_TYPES = {".mp3": "audio/mpeg", ".m4a": "audio/mp4"}
+_ENCLOSURE_TYPES = {".mp3": "audio/mpeg", ".m4a": "audio/x-m4a"}
+
+
 def _read_info_json(mp3_path):
     base, _ = os.path.splitext(mp3_path)
     info_path = base + ".info.json"
@@ -124,7 +129,7 @@ def _scan_episodes():
     subscribed = tasks.subscription_video_ids()
     items = []
     for fn in os.listdir(DOWNLOAD_DIR):
-        if not fn.lower().endswith(".mp3"):
+        if os.path.splitext(fn)[1].lower() not in _AUDIO_TYPES:
             continue
         full = os.path.join(DOWNLOAD_DIR, fn)
         try:
@@ -321,7 +326,8 @@ def generate_rss(feed: str = "", path: str = "/rss"):
         out.append(f"    <content:encoded>{_cdata(_description_html(ep))}</content:encoded>")
         out.append(f"    <pubDate>{pub}</pubDate>")
         out.append(f"    <guid isPermaLink=\"false\">{sx.escape(ep['video_id'])}</guid>")
-        out.append(f"    <enclosure url=\"{_attr(url)}\" length=\"{ep['size']}\" type=\"audio/mpeg\"/>")
+        kind = _ENCLOSURE_TYPES[os.path.splitext(ep["filename"])[1].lower()]
+        out.append(f"    <enclosure url=\"{_attr(url)}\" length=\"{ep['size']}\" type=\"{kind}\"/>")
         if ep["duration"]:
             out.append(f"    <itunes:duration>{int(ep['duration'])}</itunes:duration>")
         if ep["thumbnail"]:
@@ -354,6 +360,9 @@ h1,h2,h3,p{margin:0}
 input{font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);
 padding:8px 12px;width:100%;min-width:0}
 input::placeholder{color:var(--muted)}
+select{font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);
+padding:8px 12px}
+select.small{font-size:13px;padding:4px 8px}
 input:focus-visible{outline-offset:0;border-color:var(--text)}
 .btn{font:inherit;font-weight:600;color:var(--text);background:var(--raised);border:1px solid var(--border);
 border-radius:var(--radius-sm);padding:8px 16px;cursor:pointer;white-space:nowrap}
@@ -460,6 +469,7 @@ summary{cursor:pointer;color:var(--muted);font-size:13px}
 details pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;font-size:13px;color:var(--muted);margin:8px 0 0;
 max-height:240px;overflow:auto;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px}
 .actions{display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex:none}
+.actions.inline{flex-direction:row;align-items:center;flex-wrap:wrap;justify-content:flex-end}
 .task{align-items:center}
 .task .url{overflow-wrap:anywhere}
 .empty{color:var(--muted);padding:8px 0}
@@ -485,7 +495,8 @@ border-radius:var(--radius-sm);padding:12px;margin:0;white-space:pre-wrap;overfl
 #logCmd{max-height:20vh}
 #logOut{height:36vh}
 @media (max-width:560px){.add input{flex-basis:100%}.add .btn{flex:1}.cover{width:56px;height:56px}.actions{flex-direction:row}.row.ep{flex-wrap:wrap}
-.row.ep .actions{width:100%;justify-content:flex-end}}
+.row.ep .actions{width:100%;justify-content:flex-end}
+.row.sub{flex-wrap:wrap}.row.sub .actions{width:100%}}
 @media (prefers-reduced-motion:no-preference){.btn,input{transition:border-color .12s,background-color .12s,color .12s}}
 </style>
 <header><div class="bar">
@@ -500,9 +511,14 @@ border-radius:var(--radius-sm);padding:12px;margin:0;white-space:pre-wrap;overfl
              placeholder="Paste a YouTube video, playlist or channel address">
       <button class="btn primary" name="kind" value="video">Add video</button>
       <button class="btn" name="kind" value="subscription">Subscribe</button>
+      <select id="addItems" aria-label="When subscribing to a channel: how many of its newest videos each check looks at">
+        <option value="">Newest 10</option><option value="1">Newest 1</option><option value="3">Newest 3</option>
+        <option value="5">Newest 5</option><option value="25">Newest 25</option><option value="0">Everything</option>
+      </select>
     </form>
     <p class="muted small feed">Subscribing to a channel follows its Videos tab - no Shorts or live streams - whichever
-      channel address you paste. Checked every hour: a channel's newest 10 videos, a playlist whole.</p>
+      channel address you paste. Checked every hour. The list next to Subscribe sets how many of a channel's newest
+      videos each check looks at; a playlist is taken whole unless you pick a number.</p>
     <div class="feed small"><span class="muted">Feed</span><code id="feedUrl"></code>
       <button class="btn ghost" id="copyFeed" type="button">Copy</button><span id="feeds" class="muted"></span></div>
   </section>
@@ -664,11 +680,19 @@ async function refresh(){
     const last = !r ? '<span>first check pending</span>'
       : r.ok ? `<span>last check ${fmtWhen(s.last_poll)}: ${r.new || 0} new</span>`
       : `<span class="pill error">failed</span><span>${esc(r.error).slice(0, 200)}</span>`;
-    return `<li class="row"><div class="grow">
+    return `<li class="row sub"><div class="grow">
         <a class="title" href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.url.split('//').pop().replace('www.', ''))}</a>
-        <div class="meta"><span>${s.max_items ? 'newest '+s.max_items+' per check' : 'whole list'}</span>${last}<span>next ${fmtNext(s.next_poll)}</span></div>
+        <div class="meta">${last}<span>next ${fmtNext(s.next_poll)}</span></div>
       </div>
-      <div class="actions"><button class="btn ghost danger" data-del-sub="${esc(s.id)}" data-title="${esc(s.url)}">Unsubscribe</button></div></li>`;
+      <div class="actions inline">
+        <select class="small" data-sub-items="${esc(s.id)}" aria-label="How many of the newest items each check looks at">
+          ${[...new Set([1, 3, 5, 10, 25, 50, s.max_items])].filter(n => n > 0).sort((a, b) => a - b).map(n =>
+            `<option value="${n}"${n === s.max_items ? ' selected' : ''}>Newest ${n}</option>`).join('')}
+          <option value="0"${s.max_items === 0 ? ' selected' : ''}>Everything</option>
+        </select>
+        <button class="btn ghost" data-sub-check="${esc(s.id)}">Check now</button>
+        <button class="btn ghost danger" data-del-sub="${esc(s.id)}" data-title="${esc(s.url)}">Unsubscribe</button>
+      </div></li>`;
   }).join('') || '<li class="empty">No subscriptions.</li>');
 
   renderTasks(tasks);
@@ -752,6 +776,12 @@ async function tick(){
 document.addEventListener('click', async e => {
   const d = e.target.dataset || {};
   if(d.taskLog){ openLog(d.taskLog); return; }
+  if(d.subCheck){
+    const c = await api('POST', '/subscriptions/' + encodeURIComponent(d.subCheck) + '/check');
+    if(c.ok) toast('Checking now'); else toast(await errorOf(c), true);
+    tick();
+    return;
+  }
   let r;
   if(d.delSub){
     if(!await ask('Unsubscribe?', d.title, 'Unsubscribe')) return;
@@ -763,12 +793,22 @@ document.addEventListener('click', async e => {
   if(r.ok) toast('Removed'); else toast(await errorOf(r), true);
   tick();
 });
+document.addEventListener('change', async e => {
+  const id = (e.target.dataset || {}).subItems;
+  if(!id) return;
+  const n = Number(e.target.value);
+  const r = await api('PATCH', '/subscriptions/' + encodeURIComponent(id), {max_items: n});
+  if(r.ok) toast(n ? 'Each check now looks at the newest ' + n : 'Each check now looks at everything'); else toast(await errorOf(r), true);
+  tick();
+});
 $('addForm').onsubmit = async e => {
   e.preventDefault();
   const subscribe = e.submitter && e.submitter.value === 'subscription';
-  const r = await api('POST', subscribe ? '/subscriptions' : '/download', {url: $('addUrl').value.trim()});
+  const body = {url: $('addUrl').value.trim()};
+  if(subscribe && $('addItems').value !== '') body.max_items = Number($('addItems').value);
+  const r = await api('POST', subscribe ? '/subscriptions' : '/download', body);
   if(r.ok){
-    $('addUrl').value = '';
+    $('addUrl').value = ''; $('addItems').value = '';
     toast(subscribe ? 'Subscribed to ' + (await r.json()).url.split('//').pop().replace('www.', '') : 'Queued');
   }
   else toast(await errorOf(r), true);
@@ -1065,7 +1105,12 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(200, s)
         elif path.startswith("/audio/"):
-            self._serve_download(unquote(path[len("/audio/"):]), ".mp3", "audio/mpeg")
+            filename = unquote(path[len("/audio/"):])
+            ext = os.path.splitext(filename)[1].lower()
+            if ext in _AUDIO_TYPES:
+                self._serve_download(filename, ext, _AUDIO_TYPES[ext])
+            else:
+                self._text(400, "bad path")
         elif path.startswith("/thumb/"):
             self._serve_download(unquote(path[len("/thumb/"):]), ".jpg", "image/jpeg")
         elif path == "/artwork.jpg":
@@ -1265,6 +1310,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             task_id = enqueue_download(url)
             self._json(202, {"task_id": task_id})
+        elif self.path.startswith("/subscriptions/") and self.path.endswith("/check"):
+            task_id = tasks.check_subscription_now(unquote(self.path[len("/subscriptions/"):-len("/check")]))
+            if task_id is None:
+                self._json(404, {"error": "not found"})
+            else:
+                self._json(202, {"task_id": task_id})
         elif self.path == "/subscriptions":
             data = self._read_json()
             if data is None:
@@ -1285,6 +1336,25 @@ class Handler(BaseHTTPRequestHandler):
             self._json(201, sub)
         else:
             self._text(404, "not found")
+
+    def do_PATCH(self):
+        if self._insecure() or not self._authorized(write=True):
+            return
+        if not self.path.startswith("/subscriptions/"):
+            self._text(404, "not found")
+            return
+        data = self._read_json()
+        if data is None:
+            return
+        max_items = data.get("max_items")
+        if not isinstance(max_items, int) or isinstance(max_items, bool) or max_items < 0:
+            self._json(400, {"error": "max_items must be a whole number, 0 for everything"})
+            return
+        sub = tasks.set_subscription_items(unquote(self.path[len("/subscriptions/"):]), max_items)
+        if sub is None:
+            self._json(404, {"error": "not found"})
+        else:
+            self._json(200, sub)
 
     def do_DELETE(self):
         if self._insecure() or not self._authorized(write=True):
