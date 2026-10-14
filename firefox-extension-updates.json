@@ -1,7 +1,13 @@
 {
   "addons": {
     "youtube-podcast@maxrenke.com": {
-      "updates": []
+      "updates": [
+        {
+          "version": "1.0.0",
+          "update_link": "https://github.com/maxrenke/youtube-podcast-server/releases/download/extension-v1.0.0/youtube-podcast-1.0.0.xpi",
+          "update_hash": "sha256:6026406d57ef73834783355534597029cf1de4988250e99449cfb08a20a14fd0"
+        }
+      ]
     }
   }
 }
