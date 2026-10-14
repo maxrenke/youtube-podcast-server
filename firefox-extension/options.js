@@ -46,3 +46,5 @@ async function test() {
 $("save").addEventListener("click", save);
 $("test").addEventListener("click", test);
 getSettings().then((s) => { $("server").value = s.server; $("token").value = s.token; });
+$("version").textContent = "Version " + browser.runtime.getManifest().version +
+  " - Firefox installs newer versions by itself (about:addons, gear menu, Check for Updates to do it now).";

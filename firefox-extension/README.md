@@ -30,29 +30,38 @@ as `Authorization: Bearer`.
 The token is kept in this Firefox profile's extension storage and is only sent
 to the server address you configured.
 
-## Installing
+## Installing and updating
 
-Release Firefox only keeps extensions that Mozilla has signed.
+Release Firefox only runs extensions Mozilla has signed. This one is signed as a
+self-distributed ("unlisted") add-on - it is not listed on addons.mozilla.org - and
+published as a GitHub release of this repo.
 
-**Try it now (until Firefox restarts):** open `about:debugging#/runtime/this-firefox`,
-click *Load Temporary Add-on...* and pick `manifest.json` in this folder.
+**Install:** open the newest `youtube-podcast-<version>.xpi` from the
+[releases page](https://github.com/maxrenke/youtube-podcast-server/releases) in
+Firefox and click **Add**.
 
-**Keep it (signed, private):** sign it as an unlisted add-on. It is not
-published or reviewed for listing; you get a signed `.xpi` back.
+**Updates are automatic.** The manifest's `update_url` points at
+`firefox-extension-updates.json` in this repo. Firefox reads it about once a day
+and installs any newer signed version on its own; about:addons > gear menu >
+**Check for Updates** does it at once. The options page shows the installed
+version.
 
-1. Create API credentials at <https://addons.mozilla.org/developers/addon/api/key/>
-   (needs a Mozilla account).
-2. From this folder:
+**Releasing a new version** (from the repo root):
 
-   ```bash
-   npx web-ext sign --channel=unlisted --api-key=<JWT issuer> --api-secret=<JWT secret>
-   ```
+```powershell
+.\Publish-Extension.ps1
+```
 
-3. Open the `.xpi` that lands in `web-ext-artifacts/` with Firefox.
+It raises the version, lints, has Mozilla sign it, creates the GitHub release
+`extension-v<version>` with the signed `.xpi`, and adds it to the update file.
+It needs addons.mozilla.org API credentials - create them at
+<https://addons.mozilla.org/en-US/developers/addon/api/key/> and save the JWT
+issuer and JWT secret as two lines in `~\.amo-api-key` - plus node (`npx`) and a
+signed-in `gh`. `-WhatIf` shows what it would do; `-Version 1.2.0` picks the
+version.
 
-Without the command line: zip the *contents* of this folder and upload the zip
-at <https://addons.mozilla.org/developers/addon/submit/distribution>, choosing
-*On your own*.
+**Just trying a change** without releasing: `about:debugging#/runtime/this-firefox`
+> Load Temporary Add-on > `manifest.json` (gone after a restart).
 
 ## Files
 
