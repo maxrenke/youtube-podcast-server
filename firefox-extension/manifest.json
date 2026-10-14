@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "YouTube Podcast",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Send the video, playlist or channel you are looking at to your self-hosted youtube-podcast-server.",
   "browser_specific_settings": {
     "gecko": {
