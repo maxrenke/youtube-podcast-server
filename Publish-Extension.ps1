@@ -100,14 +100,14 @@ try {
 
     # ---- lint and sign
     Write-Host "==> Linting"
-    npx --yes $webExt lint --source-dir $source --ignore-files README.md --self-hosted --warnings-as-errors
+    npx --yes $webExt lint --source-dir $source --ignore-files README.md .amo-upload-uuid --self-hosted --warnings-as-errors
     if ($LASTEXITCODE) { throw "[!] web-ext lint found problems (see above)." }
 
     $artifacts = Join-Path ([IO.Path]::GetTempPath()) "youtube-podcast-extension-$Version"
     if (Test-Path -LiteralPath $artifacts) { Remove-Item -LiteralPath $artifacts -Recurse -Force }
     Write-Host "==> Signing with addons.mozilla.org (unlisted; usually a few minutes)"
     npx --yes $webExt sign --channel unlisted --source-dir $source --artifacts-dir $artifacts `
-        --ignore-files README.md --approval-timeout 1800000
+        --ignore-files README.md .amo-upload-uuid --approval-timeout 1800000
     if ($LASTEXITCODE) { throw "[!] Signing failed (see above). The manifest now says $Version; git checkout firefox-extension\manifest.json undoes that." }
     $xpi = Get-ChildItem -LiteralPath $artifacts -Filter *.xpi | Select-Object -First 1
     if (-not $xpi) { throw "[!] web-ext reported success but left no .xpi in $artifacts." }

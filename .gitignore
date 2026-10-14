@@ -4,3 +4,5 @@ downloads/
 state/
 .venv/
 .env
+# web-ext sign keeps the last upload id here to resume an interrupted signing
+firefox-extension/.amo-upload-uuid
