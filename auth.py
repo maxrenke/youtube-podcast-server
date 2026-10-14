@@ -11,15 +11,25 @@ Standard library only. One account, kept in ``STATE_DIR/auth.json``:
 - two-step codes are standard TOTP (RFC 6238, SHA-1, 6 digits, 30 s), and a
   code cannot be used twice;
 - failed attempts are counted per client address and lock that address out.
+
+The account is created or replaced from the server's own shell:
+
+    docker exec -it youtube-podcast-server python auth.py set-account
+
+(or at /setup with SETUP_TOKEN, if that is configured). Replacing it signs every
+session out, including those of a server process that is already running.
 """
 
+import argparse
 import base64
+import getpass
 import hashlib
 import hmac
 import json
 import os
 import secrets
 import struct
+import sys
 import threading
 import time
 from urllib.parse import quote
@@ -138,8 +148,13 @@ def password_problem(username: str, password: str) -> str:
 
 
 def set_account(username: str, password: str) -> None:
-    """Create or replace the account. Signs out every session and turns two-step off."""
-    _save_account({"username": username.strip(), "password": hash_password(password), "totp": None})
+    """Create or replace the account. Signs out every session and turns two-step off.
+
+    Sessions record the account ``version`` they were created under, so a session
+    from before the change stops working even in another process.
+    """
+    _save_account({"username": username.strip(), "password": hash_password(password), "totp": None,
+                   "version": secrets.token_hex(8)})
     with _LOCK:
         _SESSIONS.clear()
         _save_sessions()
@@ -186,7 +201,7 @@ def _expired(session: dict, now: float) -> bool:
     return now - session["seen"] > SESSION_IDLE_SECONDS or now - session["created"] > SESSION_MAX_SECONDS
 
 
-_SAVED_FIELDS = ("username", "created", "seen", "csrf", "remember")
+_SAVED_FIELDS = ("username", "created", "seen", "csrf", "remember", "account")
 _saved_at = 0.0
 
 
@@ -219,13 +234,19 @@ def _load_sessions() -> None:
                 _SESSIONS[key] = session
 
 
+def _account_version() -> str | None:
+    account = load_account()
+    return account.get("version") if account else None
+
+
 def create_session(username: str, remember: bool = False) -> str:
     session_id = secrets.token_urlsafe(32)
     now = time.time()
+    version = _account_version()
     with _LOCK:
         _SESSIONS[_key(session_id)] = {
             "username": username, "created": now, "seen": now, "csrf": secrets.token_urlsafe(32),
-            "remember": bool(remember),
+            "remember": bool(remember), "account": version,
         }
         _save_sessions()
     return session_id
@@ -236,11 +257,12 @@ def get_session(session_id: str) -> dict | None:
     if not session_id:
         return None
     now = time.time()
+    version = _account_version()
     with _LOCK:
         session = _SESSIONS.get(_key(session_id))
         if not session:
             return None
-        if _expired(session, now):
+        if _expired(session, now) or session.get("account") != version:
             del _SESSIONS[_key(session_id)]
             _save_sessions()
             return None
@@ -277,15 +299,58 @@ def locked_for(client: str) -> int:
         return int(LOCKOUT_SECONDS - (now - recent[0])) + 1
 
 
-def record_failure(client: str) -> None:
+def record_failure(client: str) -> bool:
+    """Count a failed attempt. True when this one locks the client out."""
+    now = time.time()
     with _LOCK:
-        _FAILURES.setdefault(client, []).append(time.time())
+        recent = [t for t in _FAILURES.get(client, []) if now - t < LOCKOUT_SECONDS] + [now]
+        _FAILURES[client] = recent
         # keep the table from growing without bound under a spray of addresses
         if len(_FAILURES) > 10_000:
             for stale in sorted(_FAILURES, key=lambda c: _FAILURES[c][-1])[:5_000]:
                 del _FAILURES[stale]
+        return len(recent) == MAX_FAILURES
 
 
 def clear_failures(client: str) -> None:
     with _LOCK:
         _FAILURES.pop(client, None)
+
+
+# ---------------------------------------------------------------------------
+# Command line (run on the server: docker exec -it youtube-podcast-server python auth.py ...)
+# ---------------------------------------------------------------------------
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="auth.py", description="Manage the admin account.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    setter = commands.add_parser("set-account", help="create or replace the admin account "
+                                 "(signs every session out and turns two-step sign-in off)")
+    setter.add_argument("--username", help="asked for when left out")
+    setter.add_argument("--password-stdin", action="store_true",
+                        help="read the password from standard input instead of asking twice")
+    args = parser.parse_args(argv)
+
+    username = args.username or input("User name: ")
+    if args.password_stdin:
+        password = confirm = sys.stdin.readline().rstrip("\r\n")
+    else:
+        password = getpass.getpass("New password (12 characters or more): ")
+        confirm = getpass.getpass("New password again: ")
+    problem = password_problem(username, password)
+    if not problem and password != confirm:
+        problem = "The two passwords are not the same."
+    if problem:
+        print(problem, file=sys.stderr)
+        return 1
+    set_account(username, password)
+    import notify  # only here: the server imports auth too, and sends its own notices
+    notify.send("Podcast: admin account replaced", f"Account '{username.strip()}' was set from the server's shell.",
+                "high", "warning")
+    time.sleep(1)  # let the notice go out before the process ends
+    print(f"Account '{username.strip()}' saved. Every session is signed out and two-step sign-in is off.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

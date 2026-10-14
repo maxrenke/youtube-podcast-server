@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -22,11 +23,14 @@ os.environ.update(
     STATE_DIR=os.path.join(_ROOT, "state"),
     PUBLIC_BASE_URL="https://pod.example",
     API_TOKEN="secret-token",
+    SETUP_TOKEN="setup-secret",
+    NTFY_URL="",
     SCHEDULER_TICK_SECONDS="3600",
 )
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import auth
+import notify
 import rss_downloader as server
 import tasks
 
@@ -366,8 +370,9 @@ def test_security_headers_and_https_only(base_url):
 # --- sign-in --------------------------------------------------------------------
 
 def test_account_setup_needs_the_token_and_a_real_password(base_url):
-    good = {"token": "secret-token", "username": "max", "password": PASSWORD, "password2": PASSWORD}
+    good = {"token": "setup-secret", "username": "max", "password": PASSWORD, "password2": PASSWORD}
     assert _form(base_url + "/setup", {**good, "token": "nope"})[0] == 403
+    assert _form(base_url + "/setup", {**good, "token": "secret-token"})[0] == 403  # the API token cannot do it
     assert _form(base_url + "/setup", {**good, "password": "short", "password2": "short"})[0] == 400
     assert _form(base_url + "/setup", {**good, "password2": PASSWORD + "x"})[0] == 400
     assert _form(base_url + "/setup", good, {"Origin": "https://evil.example"})[0] == 403
@@ -376,6 +381,125 @@ def test_account_setup_needs_the_token_and_a_real_password(base_url):
     assert (status, headers["Location"]) == (303, "/login?s")
     stored = auth.load_account()
     assert stored["username"] == "max" and PASSWORD not in json.dumps(stored)
+
+
+def test_web_setup_is_off_without_a_setup_token(base_url, monkeypatch):
+    monkeypatch.setattr(server, "SETUP_TOKEN", "")
+    page = _request(base_url + "/setup")[2].decode()
+    assert "python auth.py set-account" in page and "<form" not in page
+    good = {"token": "", "username": "max", "password": PASSWORD, "password2": PASSWORD}
+    for token in ("", "secret-token"):
+        assert _form(base_url + "/setup", {**good, "token": token})[0] == 403
+    assert auth.load_account() is None
+
+
+def test_account_set_from_the_shell_signs_out_sessions_of_the_running_server(base_url):
+    _, session, _ = _sign_in(base_url)
+    assert _request(base_url + "/episodes", headers=session)[0] == 200
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    run = subprocess.run(
+        [sys.executable, "auth.py", "set-account", "--username", "max", "--password-stdin"],
+        input=PASSWORD + "2\n", capture_output=True, text=True, cwd=repo, timeout=60, check=False,
+        env={**os.environ, "STATE_DIR": tasks.STATE_DIR, "NTFY_URL": ""},
+    )
+    assert run.returncode == 0, run.stderr
+    assert "saved" in run.stdout
+    # a different process replaced the account; this server's session no longer counts
+    assert _request(base_url + "/episodes", headers=session)[0] == 401
+    assert auth.check_login("max", PASSWORD + "2") and not auth.check_login("max", PASSWORD)
+    weak = subprocess.run([sys.executable, "auth.py", "set-account", "--username", "max", "--password-stdin"],
+                          input="short\n", capture_output=True, text=True, cwd=repo, timeout=60, check=False,
+                          env={**os.environ, "STATE_DIR": tasks.STATE_DIR, "NTFY_URL": ""})
+    assert weak.returncode == 1 and "12 characters" in weak.stderr
+
+
+@pytest.fixture
+def ntfy(monkeypatch):
+    """A stand-in ntfy server; yields the list of notices it received."""
+    from http.server import BaseHTTPRequestHandler
+    received = []
+
+    class Topic(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers["Content-Length"])).decode()
+            received.append({"title": self.headers["Title"], "priority": self.headers["Priority"],
+                             "tags": self.headers.get("Tags", ""), "body": body})
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Topic)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    monkeypatch.setattr(notify, "NTFY_URL", f"http://127.0.0.1:{httpd.server_address[1]}/topic")
+    yield received
+    httpd.shutdown()
+
+
+def _wait_for(received, count):
+    for _ in range(100):
+        if len(received) >= count:
+            break
+        time.sleep(0.05)
+    time.sleep(0.2)  # nothing more should arrive
+    return [n["title"] for n in received]
+
+
+def test_notices_for_sign_in_lockout_two_step_and_setup(base_url, ntfy):
+    _, _, write = _sign_in(base_url, client="198.51.100.20")
+    assert _wait_for(ntfy, 1) == ["Podcast: signed in"]
+    assert ntfy[0]["body"] == "max from 198.51.100.20" and ntfy[0]["tags"] == "key"
+
+    attacker = {"CF-Connecting-IP": "203.0.113.50"}
+    for _ in range(auth.MAX_FAILURES + 2):  # more than enough: only the lock itself is reported
+        _form(base_url + "/login", {"username": "max", "password": "guess guess guess"}, attacker)
+    titles = _wait_for(ntfy, 2)
+    assert titles.count("Podcast: sign-in locked") == 1
+    locked = next(n for n in ntfy if n["title"] == "Podcast: sign-in locked")
+    assert locked["priority"] == "high" and "203.0.113.50" in locked["body"]
+
+    started = json.loads(_request(base_url + "/account/totp", "POST", {"action": "start"}, write)[2])
+    code = auth._totp_code(started["secret"], int(time.time() // 30))
+    _request(base_url + "/account/totp", "POST", {"action": "confirm", "code": code}, write)
+    _request(base_url + "/account/totp", "POST", {"action": "disable", "password": PASSWORD}, write)
+    titles = _wait_for(ntfy, 4)
+    assert titles[-2:] == ["Podcast: two-step sign-in turned on", "Podcast: two-step sign-in turned OFF"]
+    assert ntfy[-1]["priority"] == "high"
+
+    _form(base_url + "/setup", {"token": "setup-secret", "username": "max", "password": PASSWORD, "password2": PASSWORD})
+    assert _wait_for(ntfy, 5)[-1] == "Podcast: admin account replaced"
+
+
+def test_notices_for_a_failed_download_and_a_subscription_that_starts_failing(ntfy, monkeypatch):
+    def broken(task, workdir):
+        raise RuntimeError("WARNING: something\nERROR: [youtube] abc: Video unavailable")
+
+    monkeypatch.setattr(tasks, "_ytdlp_single", broken)
+    queue = tasks.Queue()
+    threading.Thread(target=tasks._worker, args=(queue,), daemon=True).start()
+    task = {"id": "fail1", "type": "video", "url": "https://youtu.be/abc", "status": "queued", "attempts": 1}
+    tasks.TASKS["fail1"] = task
+    queue.put(task)  # its second and last try
+    try:
+        assert _wait_for(ntfy, 1) == ["Podcast: download failed"]
+        assert ntfy[0]["body"] == "https://youtu.be/abc\nERROR: [youtube] abc: Video unavailable"
+        assert task["status"] == "error"
+    finally:
+        tasks.TASKS.pop("fail1", None)
+
+    monkeypatch.setattr(tasks, "_ytdlp_playlist", lambda task, workdir: (_ for _ in ()).throw(RuntimeError("ERROR: blocked")))
+    monkeypatch.setattr(tasks, "SUB_QUEUE", tasks.Queue())
+    sub = tasks.add_subscription("https://www.youtube.com/@SomeChannel")
+    try:
+        poll = {"id": "p1", "subscription_id": sub["id"], "url": sub["url"], "max_items": 10}
+        for _ in range(3):  # fails three hours running: one notice
+            with pytest.raises(RuntimeError):
+                tasks._handle_subscription_task(dict(poll))
+        assert _wait_for(ntfy, 2)[1:] == ["Podcast: subscription check failed"]
+        assert ntfy[1]["body"] == sub["url"] + "\nERROR: blocked"
+    finally:
+        tasks.remove_subscription(sub["id"])
 
 
 def test_sign_in_sets_a_locked_down_cookie_and_wrong_details_do_not(base_url):

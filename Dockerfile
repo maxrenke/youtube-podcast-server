@@ -21,7 +21,7 @@ RUN useradd --uid 1000 --create-home app \
     && chown -R app:app /opt/yt-dlp /app
 ENV PATH=/opt/yt-dlp:$PATH
 
-COPY rss_downloader.py tasks.py auth.py artwork.jpg ./
+COPY rss_downloader.py tasks.py auth.py notify.py artwork.jpg ./
 USER app
 
 ENV PORT=8080 \

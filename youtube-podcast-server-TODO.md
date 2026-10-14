@@ -74,6 +74,11 @@ confirmed against the live site before the fix and re-tested after it.
 | S13 | Info | A Cloudflare API token that can edit every zone on the account sits in a file on the PC and never expires. It was only needed for set-up. | Fixed 2026-10-08: token deleted in the Cloudflare dashboard |
 | S14 | Info | yt-dlp is fetched unpinned at build time and self-updates at start. | Accepted: needed to keep YouTube working |
 
+Follow-up 2026-10-14: the account can no longer be replaced with the API token. It is set from the
+server's shell (`python auth.py set-account`), or at `/setup` only with a separate `SETUP_TOKEN`; a
+replaced account signs out every session, also in a running server. Sign-ins, lockouts, two-step
+changes, account changes and failed downloads are pushed to ntfy.
+
 Checked and found in order: TLS 1.2 and 1.3 only at the edge; no secrets in
 git history; token comparison is constant-time; path traversal on `/audio`
 and `/thumb` is refused; the extension keeps its token in extension storage

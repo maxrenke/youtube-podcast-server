@@ -77,6 +77,8 @@ All via env vars. Defaults shown.
 | `FEED_CATEGORY`           | `Technology`                     | `<itunes:category>`. Must be one of Apple's category names.                          |
 | `FEED_PRIVATE`            | `1`                              | Emits `<itunes:block>Yes</itunes:block>` so directories do not list the feed. `0` to drop it. |
 | `API_TOKEN`               | unset                            | Secret for POST and DELETE requests. Unset = no authentication (a warning is logged). |
+| `SETUP_TOKEN`             | unset                            | Allows creating or replacing the account at `/setup` with this token. Unset, only `python auth.py set-account` on the server can. |
+| `NTFY_URL`                | unset                            | ntfy topic address for notices (see Notifications). |
 | `AUDIO_FORMAT`            | `m4a`                            | `m4a`: YouTube's own 128 kbps AAC stream kept as it is - no re-encoding, so adding is fast and nothing is lost (about 1 MB per minute). `m4a-small`: its 48 kbps stream, about a third of that. `mp3`: re-encode at `AUDIO_QUALITY`. |
 | `AUDIO_QUALITY`           | `5`                              | Only with `AUDIO_FORMAT=mp3`: LAME VBR quality, 0 (largest) to 9. 5 is about 0.55 MB per minute. |
 | `SUB_MAX_ITEMS`           | `10`                             | Entries from the top of a channel looked at per poll. 0 = all. Playlists default to all. |
@@ -484,10 +486,37 @@ Cloudflare Tunnel (`casaos`) to `http://172.17.0.1:5757`.
 
 ## Signing in
 
-**First time, or after forgetting the password:** open `/setup`, enter the API
-token (the `API_TOKEN` value in the server's `.env`), a user name and a
-password of 12 characters or more. Doing this again replaces the account,
-signs out every session and turns two-step sign-in off.
+**First time, or after forgetting the password:** on the server, run
+
+```bash
+docker exec -it youtube-podcast-server python auth.py set-account
+```
+
+It asks for a user name and a password of 12 characters or more, replaces the
+account if there is one, signs every session out (including those of the
+running server) and turns two-step sign-in off. Doing this needs a shell on
+the box, so neither the API token nor anything a browser holds can take over
+the account. `--username NAME --password-stdin` makes it scriptable.
+
+Web set-up at `/setup` is off unless `SETUP_TOKEN` is set in `.env`; with it
+set, `/setup` takes that token (not the API token) and does the same.
+
+## Notifications
+
+With `NTFY_URL` set to an [ntfy](https://ntfy.sh) topic address, the server
+pushes a notice for:
+
+| Notice | Priority |
+|---|---|
+| a sign-in (user, address, whether kept signed in) | default |
+| an address locked out after 5 failed attempts - password, code, API token or set-up token | high |
+| two-step sign-in turned on / turned off | default / high |
+| the admin account replaced (shell or `/setup`) | high |
+| a download that failed for good (after its retry) | default |
+| a subscription whose check starts failing (once, not every hour) | default |
+
+Failed sign-ins below the lockout are only logged, so guessing does not flood
+the phone. Notices never contain a password, token or session id.
 
 **Two-step sign-in:** on the admin page choose *Turn on*, add the key to an
 authenticator app, and confirm with the code it shows. From then on `/login`

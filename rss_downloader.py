@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import auth
+import notify
 import tasks
 from tasks import (
     DOWNLOAD_DIR,
@@ -49,6 +50,9 @@ ARTWORK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artwork
 # - a person signs in at /login with the account created at /setup (auth.py),
 #   and the browser then carries a session cookie.
 API_TOKEN = os.environ.get("API_TOKEN", "")
+# A separate secret for /setup, which can replace the account. Unset (the default),
+# the account can only be set from the server's shell: python auth.py set-account.
+SETUP_TOKEN = os.environ.get("SETUP_TOKEN", "")
 _ORIGIN = urlsplit(PUBLIC_BASE_URL)
 PUBLIC_ORIGIN = f"{_ORIGIN.scheme}://{_ORIGIN.netloc}"
 SECURE = _ORIGIN.scheme == "https"
@@ -413,10 +417,16 @@ _LOGIN_FORM = """<form method="post" action="/login">
 <button class="btn primary">Sign in</button>
 </form>"""
 
+_SETUP_OFF = """<p class="muted small">Setting the account up from the web is turned off. On the server, run</p>
+<p><code>docker exec -it youtube-podcast-server python auth.py set-account</code></p>
+<p class="muted small">It asks for a user name and a password, replaces the account if there is one, signs
+every session out and turns two-step sign-in off. To use this page instead, put a SETUP_TOKEN in the
+server's .env.</p>"""
+
 _SETUP_FORM = """<p class="muted small">Creates the admin account, or replaces it if you forgot the password.
-The API token proves you control the server; it is the API_TOKEN value in the server's .env file.</p>
+The set-up token proves you control the server; it is the SETUP_TOKEN value in the server's .env file.</p>
 <form method="post" action="/setup">
-<label for="t">API token</label><input id="t" name="token" type="password" autocomplete="off" required>
+<label for="t">Set-up token</label><input id="t" name="token" type="password" autocomplete="off" required>
 <label for="u">User name</label><input id="u" name="username" autocomplete="username" required>
 <label for="p">New password <span class="muted">(12 characters or more)</span></label>
 <input id="p" name="password" type="password" autocomplete="new-password" minlength="12" required>
@@ -1035,7 +1045,7 @@ class Handler(BaseHTTPRequestHandler):
             self._form_page(200, "Sign in", body)
             return
         if path == "/setup":
-            self._form_page(200, "Set up the admin account", _SETUP_FORM)
+            self._form_page(200, "Set up the admin account", _SETUP_FORM if SETUP_TOKEN else _SETUP_OFF)
             return
         if not _is_public(path) and not self._authorized():
             return
@@ -1137,8 +1147,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._refuse(429, f"too many failed attempts; try again in {wait} s", wait)
             if hmac.compare_digest(value.strip().encode(), API_TOKEN.encode()):
                 return True
-            auth.record_failure(client)
-            print(f"[auth] wrong API token from {client}", flush=True)
+            self._failed(client, "API token")
             return self._refuse(401, "missing or wrong API token")
         session = auth.get_session(self._session_id())
         if session:
@@ -1155,6 +1164,15 @@ class Handler(BaseHTTPRequestHandler):
             self._redirect("/login")
             return False
         return self._refuse(401, "sign in, or send the API token")
+
+    def _failed(self, client: str, what: str) -> None:
+        """Count a failed attempt; the one that locks the client out is also pushed as a notice."""
+        print(f"[auth] failed {what} from {client}", flush=True)
+        if auth.record_failure(client):
+            minutes = auth.LOCKOUT_SECONDS // 60
+            notify.send("Podcast: sign-in locked",
+                        f"{auth.MAX_FAILURES} failed attempts from {client} (last: {what}). "
+                        f"That address is locked out for {minutes} minutes.", "high", "warning")
 
     def _read_form(self) -> dict | None:
         """A urlencoded form body as a dict, or None after answering with an error."""
@@ -1190,11 +1208,13 @@ class Handler(BaseHTTPRequestHandler):
             auth.clear_failures(client)
             remember = form.get("remember") == "1"
             print(f"[auth] sign-in from {client}{' (kept signed in)' if remember else ''}", flush=True)
+            notify.send("Podcast: signed in",
+                        f"{username.strip()} from {client}" + (", kept signed in for 30 days" if remember else ""),
+                        "default", "key")
             session_id = auth.create_session(username.strip(), remember)
             self._redirect("/", self._cookie(session_id, auth.REMEMBER_SECONDS if remember else None))
         else:
-            auth.record_failure(client)
-            print(f"[auth] failed sign-in from {client}", flush=True)
+            self._failed(client, "sign-in")
             self._redirect("/login?e")
 
     def _setup(self):
@@ -1202,13 +1222,12 @@ class Handler(BaseHTTPRequestHandler):
         form = self._read_form()
         if form is None or self._locked_page(client):
             return
-        if not API_TOKEN:
-            self._form_page(403, "Set up the admin account", _message("Set API_TOKEN on the server first."))
+        if not SETUP_TOKEN:
+            self._form_page(403, "Set up the admin account", _SETUP_OFF)
             return
-        if not hmac.compare_digest(form.get("token", "").strip().encode(), API_TOKEN.encode()):
-            auth.record_failure(client)
-            print(f"[auth] failed account setup from {client}", flush=True)
-            self._form_page(403, "Set up the admin account", _message("Wrong API token.") + _SETUP_FORM)
+        if not hmac.compare_digest(form.get("token", "").strip().encode(), SETUP_TOKEN.encode()):
+            self._failed(client, "account set-up")
+            self._form_page(403, "Set up the admin account", _message("Wrong set-up token.") + _SETUP_FORM)
             return
         username, password = form.get("username", ""), form.get("password", "")
         problem = auth.password_problem(username, password)
@@ -1219,6 +1238,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         auth.set_account(username, password)
         print(f"[auth] admin account set from {client}", flush=True)
+        notify.send("Podcast: admin account replaced", f"Account '{username.strip()}' was set at /setup from {client}.",
+                    "high", "warning")
         self._redirect("/login?s")
 
     def _two_step(self, data):
@@ -1239,13 +1260,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             auth.set_totp(secret)
             session.pop("pending_totp", None)
+            notify.send("Podcast: two-step sign-in turned on", f"by {account['username']} from {self._client()}",
+                        "default", "lock")
             self._json(200, {"two_step": True})
         elif action == "disable":
             if not auth.verify_password(str(data.get("password", "")), account["password"]):
-                auth.record_failure(self._client())
+                self._failed(self._client(), "password to turn two-step off")
                 self._json(403, {"error": "wrong password"})
                 return
             auth.set_totp(None)
+            notify.send("Podcast: two-step sign-in turned OFF", f"by {account['username']} from {self._client()}",
+                        "high", "warning")
             self._json(200, {"two_step": False})
         else:
             self._json(400, {"error": "unknown action"})

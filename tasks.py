@@ -32,6 +32,8 @@ from datetime import UTC, datetime
 from queue import Queue
 from urllib.parse import urlsplit
 
+import notify
+
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
 STATE_DIR = os.environ.get("STATE_DIR", "state")
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", str(60 * 60)))
@@ -785,6 +787,11 @@ def _handle_subscription_task(task: dict) -> None:
         with SUBS_LOCK:
             sub = SUBSCRIPTIONS.get(sub_id)
             interval = sub["interval_seconds"] if sub else POLL_INTERVAL_SECONDS
+            was_ok = not sub or not sub.get("last_result") or sub["last_result"].get("ok")
+        # tell once when a subscription starts failing, not on every hourly retry
+        if was_ok and not result["ok"] and not task.get("cancelled"):
+            notify.send("Podcast: subscription check failed",
+                        f"{task['url']}\n{str(result['error']).strip().splitlines()[-1][:300]}", "default", "x")
         _update_subscription(
             sub_id,
             last_poll=_now_iso(),
@@ -832,6 +839,8 @@ def _worker(q: "Queue[dict]") -> None:
                 _set(task, status=STATUS_ERROR, error=error, ended=_now_iso())
                 if task["type"] == TYPE_VIDEO:
                     shutil.rmtree(os.path.join(INCOMING_DIR, task["id"]), ignore_errors=True)
+                    last_line = error.strip().splitlines()[-1] if error.strip() else "unknown error"
+                    notify.send("Podcast: download failed", f"{task['url']}\n{last_line[:300]}", "default", "x")
         finally:
             q.task_done()
 
