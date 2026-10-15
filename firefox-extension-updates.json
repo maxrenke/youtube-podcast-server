@@ -3,6 +3,11 @@
     "youtube-podcast@maxrenke.com": {
       "updates": [
         {
+          "version": "1.0.2",
+          "update_link": "https://github.com/maxrenke/youtube-podcast-server/releases/download/extension-v1.0.2/youtube-podcast-1.0.2.xpi",
+          "update_hash": "sha256:b7873f3a9873e70dc75a7ea70e38a436695b83bd748da5497815a5b183547738"
+        },
+        {
           "version": "1.0.1",
           "update_link": "https://github.com/maxrenke/youtube-podcast-server/releases/download/extension-v1.0.1/youtube-podcast-1.0.1.xpi",
           "update_hash": "sha256:ba61e9a9d035e644008b5b8492ce6a80611ec7b21db5dda60ec553b52d2bb8fa"
