@@ -8,10 +8,13 @@ youtube-podcast-server.
 - **Toolbar button** - opens a small panel for the current tab: *Add this
   video*, *Subscribe to this playlist or channel*, the server's most recent
   tasks, and links to the server page and the options.
-- **Right-click menu** - on a link: *Add linked video to podcast* /
-  *Subscribe podcast to linked playlist or channel*. On a page: the same for
-  the page itself. Handy on YouTube's home page and search results, where you
-  can queue a video without opening it.
+- **Right-click menu** - right-click a video thumbnail or link anywhere (home
+  page, search results, a channel's Videos tab, the sidebar) for *Add video to
+  podcast*, so you can queue it without opening it; a channel or playlist link
+  gives *Subscribe podcast to this channel or playlist*. On a video's own page,
+  or a channel or playlist page, the same item is there for the page itself.
+  Each item only shows on the YouTube addresses it can use, so it sits at the
+  top level of the menu, not in a submenu, and other sites show nothing.
 - **Notification** when a queued video is in the feed (or failed), and a badge
   on the button counting downloads still running.
 

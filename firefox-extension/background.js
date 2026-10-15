@@ -73,10 +73,18 @@ async function fromMenu(action, url) {
   }
 }
 
-browser.menus.create({ id: "add-link", contexts: ["link"], title: "Add linked video to podcast" });
-browser.menus.create({ id: "add-page", contexts: ["page", "video"], title: "Add this video to podcast" });
-browser.menus.create({ id: "sub-link", contexts: ["link"], title: "Subscribe podcast to linked playlist or channel" });
-browser.menus.create({ id: "sub-page", contexts: ["page"], title: "Subscribe podcast to this playlist or channel" });
+// Each item only appears on the kind of YouTube address it can use, so a right
+// click shows one item at the top level of the menu rather than a submenu.
+const VIDEOS = ["*://*.youtube.com/watch*", "*://*.youtube.com/shorts/*", "*://youtu.be/*"];
+const LISTS = [
+  "*://*.youtube.com/@*", "*://*.youtube.com/channel/*", "*://*.youtube.com/c/*",
+  "*://*.youtube.com/user/*", "*://*.youtube.com/playlist*",
+];
+const icons = { 16: "icons/icon-48.png", 32: "icons/icon-48.png" };
+browser.menus.create({ id: "add-link", contexts: ["link"], targetUrlPatterns: VIDEOS, icons, title: "Add video to podcast" });
+browser.menus.create({ id: "add-page", contexts: ["page", "video"], documentUrlPatterns: VIDEOS, icons, title: "Add this video to podcast" });
+browser.menus.create({ id: "sub-link", contexts: ["link"], targetUrlPatterns: LISTS, icons, title: "Subscribe podcast to this channel or playlist" });
+browser.menus.create({ id: "sub-page", contexts: ["page"], documentUrlPatterns: LISTS, icons, title: "Subscribe podcast to this channel or playlist" });
 
 browser.menus.onClicked.addListener((info, tab) => {
   const url = info.menuItemId.endsWith("-link") ? info.linkUrl : info.pageUrl || (tab && tab.url);
