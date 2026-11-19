@@ -1022,7 +1022,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _serve_download(self, filename, ext, ctype):
         """Serve ``filename`` from DOWNLOAD_DIR if it is a plain name with extension ``ext``."""
-        if "/" in filename or "\\" in filename or ".." in filename or not filename.lower().endswith(ext):
+        # No separators means no way out of DOWNLOAD_DIR; ".." inside a name ("Hang Up... [id]") is fine.
+        if "/" in filename or "\\" in filename or filename in (".", "..") or not filename.lower().endswith(ext):
             self._text(400, "bad path")
             return
         self._serve_file(os.path.join(DOWNLOAD_DIR, filename), ctype)

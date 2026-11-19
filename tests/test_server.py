@@ -306,6 +306,10 @@ def test_range_head_and_path_checks(base_url):
     status, headers, body = _request(audio, method="HEAD")
     assert (status, headers["Content-Length"], body) == (200, "1024", b"")
     assert _request(f"{base_url}/audio/..%2Fstate%2Fx.mp3")[0] == 400
+    assert _request(f"{base_url}/audio/..%5Cstate%5Cx.mp3")[0] == 400
+    dots = _add_episode("vid00000002", "Hang Up...", "Channel A", 1001)
+    assert _request(f"{base_url}/audio/{urllib.request.quote(dots)}.mp3")[0] == 200
+    assert _request(f"{base_url}/thumb/{urllib.request.quote(dots)}.jpg")[0] == 200
     assert _request(f"{base_url}/thumb/{urllib.request.quote(stem)}.info.json")[0] == 400
     assert _request(f"{base_url}/rss", method="HEAD")[0] == 200
     assert b'href="https://pod.example/feed" rel="self"' in _request(f"{base_url}/feed")[2]
